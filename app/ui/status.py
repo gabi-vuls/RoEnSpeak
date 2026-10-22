@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from app.contracts import AppState, EngineInfo
+from app.contracts import IS_MACOS, AppState, EngineInfo
 
 #: Status-line wording per state (spec: idle / downloading / loading model / ready / listening /
 #: processing / error).
@@ -76,12 +76,18 @@ def status_text(
     return f"{label}: {detail}" if detail else label
 
 
+#: Shown when the engine reports a GPU device but no device name. "CUDA GPU" would be a lie
+#: on macOS, where the engine runs on Metal (and normally reports the real chip, e.g.
+#: "Apple M2 Pro").
+DEFAULT_GPU_NAME = "Metal GPU" if IS_MACOS else "CUDA GPU"
+
+
 def engine_text(info: Optional[EngineInfo]) -> str:
     if info is None:
         return "Model not loaded"
     if info.device == "cpu":
         return f"CPU mode (slow) · {info.model} · {info.compute_type}"
-    gpu = info.gpu_name or "CUDA GPU"
+    gpu = info.gpu_name or DEFAULT_GPU_NAME
     return f"{gpu} · {info.model} · {info.compute_type}"
 
 

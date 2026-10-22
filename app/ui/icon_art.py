@@ -126,3 +126,132 @@ def render_app_icon(size: int) -> QImage:
         p.drawEllipse(QRectF(r.right() - d * 1.45, r.top() + d * 0.45, d, d))
     p.end()
     return img
+
+
+# ---------------------------------------------------------------------------
+# macOS template (mask) artwork
+# ---------------------------------------------------------------------------
+#
+# A macOS status item takes a *template* image: only its alpha channel is used, and the
+# system paints it black on a light menu bar and white on a dark one (and inverted while the
+# menu is open). That erases the colour-coded state language of the tray icons above, so the
+# template set distinguishes the states by silhouette instead:
+#
+#   disarmed    microphone with a slash through it      (hotkey off)
+#   ready       plain microphone
+#   listening   microphone with sound waves
+#   processing  three dots                              (thinking)
+#   loading     download arrow                          (downloading / loading the model)
+#   error       exclamation mark
+#
+# Each glyph has a clearly different outline, so they are still told apart at 16 px in a
+# monochrome menu bar.
+
+#: Sizes written for the macOS status item: 1x, 2x (Retina) and 4x.
+TRAY_TEMPLATE_SIZES = (16, 32, 64)
+
+
+def draw_waves(p: QPainter, rect: QRectF, color: QColor) -> None:
+    """Two arcs either side of the centre, like radiating sound."""
+    s = min(rect.width(), rect.height())
+    pen = QPen(color, max(1.1, 0.075 * s))
+    pen.setCapStyle(Qt.RoundCap)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    cx, cy = rect.center().x(), rect.center().y()
+    w = rect.width() * 0.92
+    h = rect.height() * 0.82
+    box = QRectF(cx - w / 2, cy - h / 2, w, h)
+    path = QPainterPath()
+    path.arcMoveTo(box, 36)  # right side, 36° to -36°
+    path.arcTo(box, 36, -72)
+    path.arcMoveTo(box, 144)  # left side
+    path.arcTo(box, 144, 72)
+    p.drawPath(path)
+
+
+def draw_slash(p: QPainter, rect: QRectF, color: QColor) -> None:
+    """A diagonal line with a cleared gap around it, so it reads over the glyph below."""
+    s = min(rect.width(), rect.height())
+    inset = 0.06 * s
+    a = QPointF(rect.left() + inset, rect.top() + inset)
+    b = QPointF(rect.right() - inset, rect.bottom() - inset)
+    gap = QPen(QColor(0, 0, 0, 255), max(2.0, 0.17 * s))
+    gap.setCapStyle(Qt.RoundCap)
+    p.save()
+    p.setCompositionMode(QPainter.CompositionMode_Clear)
+    p.setPen(gap)
+    p.drawLine(a, b)
+    p.restore()
+    line = QPen(color, max(1.2, 0.095 * s))
+    line.setCapStyle(Qt.RoundCap)
+    p.setPen(line)
+    p.setBrush(Qt.NoBrush)
+    p.drawLine(a, b)
+
+
+def draw_dots(p: QPainter, rect: QRectF, color: QColor) -> None:
+    """Three dots in a row ("working on it")."""
+    s = min(rect.width(), rect.height())
+    r = 0.105 * s
+    cy = rect.center().y()
+    cx = rect.center().x()
+    p.setPen(Qt.NoPen)
+    p.setBrush(QBrush(color))
+    for dx in (-0.3 * s, 0.0, 0.3 * s):
+        p.drawEllipse(QPointF(cx + dx, cy), r, r)
+
+
+def draw_download(p: QPainter, rect: QRectF, color: QColor) -> None:
+    """Arrow pointing down onto a baseline."""
+    s = min(rect.width(), rect.height())
+    cx = rect.center().x()
+    top = rect.top() + (rect.height() - s) / 2
+    shaft_w = 0.16 * s
+    head_w = 0.46 * s
+    head_top = top + 0.38 * s
+    tip_y = top + 0.68 * s
+    p.setPen(Qt.NoPen)
+    p.setBrush(QBrush(color))
+    arrow = QPainterPath()
+    arrow.addRect(QRectF(cx - shaft_w / 2, top + 0.06 * s, shaft_w, head_top - top - 0.06 * s))
+    head = QPainterPath()
+    head.moveTo(cx - head_w / 2, head_top)
+    head.lineTo(cx + head_w / 2, head_top)
+    head.lineTo(cx, tip_y)
+    head.closeSubpath()
+    p.drawPath(arrow.united(head))
+    bar_h = max(1.2, 0.1 * s)
+    p.drawRect(QRectF(cx - head_w / 2, top + 0.84 * s, head_w, bar_h))
+
+
+def render_tray_template(state: str, size: int) -> QImage:
+    """Monochrome, transparent-background silhouette for a macOS status item.
+
+    Only the alpha channel matters (QIcon.setIsMask(True) / NSImage.isTemplate), so
+    everything is drawn in opaque black.
+    """
+    if state not in TRAY_COLORS:
+        raise ValueError(f"unknown tray state: {state!r}")
+    img = QImage(size, size, QImage.Format_ARGB32_Premultiplied)
+    img.fill(Qt.transparent)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    ink = QColor(0, 0, 0, 255)
+    pad = size * 0.09
+    box = QRectF(0, 0, size, size).adjusted(pad, pad, -pad, -pad)
+    if state == "error":
+        draw_exclamation(p, box, ink)
+    elif state == "processing":
+        draw_dots(p, box, ink)
+    elif state == "loading":
+        draw_download(p, box, ink)
+    else:
+        narrow = box.width() * (0.17 if state == "listening" else 0.07)
+        draw_mic(p, box.adjusted(narrow, 0.0, -narrow, 0.0), ink)
+        if state == "listening":
+            draw_waves(p, box, ink)
+        elif state == "disarmed":
+            draw_slash(p, box, ink)
+    p.end()
+    return img

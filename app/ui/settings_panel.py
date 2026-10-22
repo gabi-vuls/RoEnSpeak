@@ -1,5 +1,10 @@
 """Settings tabs (General / Model / Advanced) with an explicit Apply button.
 
+Labels and hints are platform-aware (autostart wording, the paste shortcut, "VRAM" vs
+"unified memory", NVIDIA vs Metal, and the download size of the CTranslate2 model directory
+vs the single ggml file). No config value, field name or enum value changes with the
+platform: one config.json stays valid on both.
+
 Changes are staged in the widgets and applied together with Apply, because model, compute type
 and CPU mode changes trigger a model reload/download; applying each spin-box click live would
 thrash the GPU. Revert reloads the widgets from Controller.config. Dirty state is computed by
@@ -32,6 +37,7 @@ from PySide6.QtWidgets import (
 from app.contracts import (
     DEFAULT_BLOCKLIST,
     DEFAULT_MODEL,
+    IS_MACOS,
     MODELS,
     AppError,
     ComputeType,
@@ -50,14 +56,55 @@ OK_COLOR = "#1f9d55"
 HINT_COLOR = "#7a7f87"  # readable on both light and dark backgrounds
 
 TASK_ITEMS = (("Translate Romanian → English", Task.TRANSLATE), ("Romanian transcription only", Task.TRANSCRIBE))
+
+#: Keystroke injection is SendInput on Windows and CGEvent on macOS; the enum value stays
+#: "sendinput" either way, so naming the API in the label would be wrong on a Mac.
 INJECTION_ITEMS = (
-    ("Type keystrokes (SendInput)", InjectionMode.SENDINPUT),
+    ("Type keystrokes" if IS_MACOS else "Type keystrokes (SendInput)", InjectionMode.SENDINPUT),
     ("Paste via clipboard", InjectionMode.CLIPBOARD),
 )
-COMPUTE_ITEMS = (
-    ("float16 (best, more VRAM)", ComputeType.FLOAT16),
-    ("int8_float16 (less VRAM)", ComputeType.INT8_FLOAT16),
-)
+#: The paste shortcut the clipboard mode presses.
+PASTE_SHORTCUT = "⌘V" if IS_MACOS else "Ctrl+V"
+#: On macOS the compute type selects a ggml quantization baked into the model file (f16 /
+#: q5_0) instead of a ctranslate2 runtime compute type, and memory is unified, so "VRAM" is
+#: the wrong word. The enum values are unchanged (see ComputeType in contracts).
+if IS_MACOS:
+    COMPUTE_ITEMS = (
+        ("float16 (best quality, more memory)", ComputeType.FLOAT16),
+        ("int8_float16 (smaller, less memory)", ComputeType.INT8_FLOAT16),
+    )
+else:
+    COMPUTE_ITEMS = (
+        ("float16 (best, more VRAM)", ComputeType.FLOAT16),
+        ("int8_float16 (less VRAM)", ComputeType.INT8_FLOAT16),
+    )
+#: "VRAM" (dedicated NVIDIA memory) vs "unified memory" (Apple silicon).
+MEMORY_NAME = "unified memory" if IS_MACOS else "VRAM"
+
+
+def autostart_label() -> str:
+    """"Start with Windows" / "Open at login", from the one platform dispatch module.
+
+    Defensive: app.core.platform may be unavailable in a stripped build, and the UI must
+    still come up.
+    """
+    try:
+        from app.core import platform
+
+        return platform.autostart_label()
+    except Exception:  # noqa: BLE001 (label only; never break the settings panel)
+        log.debug("platform.autostart_label() unavailable", exc_info=True)
+        return "Open at login" if IS_MACOS else "Start with Windows"
+
+
+def download_mb(spec, compute_type: ComputeType) -> int:
+    """Download size for the model files this platform actually fetches: the CTranslate2
+    model directory (Windows) or the single ggml file for this quantization (macOS)."""
+    if IS_MACOS:
+        size = spec.ggml_mb.get(compute_type)
+        if size:
+            return int(size)
+    return int(spec.download_mb)
 
 
 def models_for_task(task: Task) -> list[str]:
@@ -164,13 +211,14 @@ class SettingsPanel(QWidget):
             self.injection_combo.addItem(text, mode)
         self.injection_combo.setToolTip(
             "Keystrokes work almost everywhere and leave the clipboard alone.\n"
-            "Clipboard paste is faster for long text; the previous clipboard is restored."
+            f"Clipboard paste copies the text and presses {PASTE_SHORTCUT}: faster for long "
+            "text, and the previous clipboard is restored."
         )
         form.addRow("Typing method", self.injection_combo)
 
         self.overlay_check = QCheckBox("Show “● REC” overlay while listening")
         self.sounds_check = QCheckBox("Play start/stop sounds")
-        self.autostart_check = QCheckBox("Start with Windows")
+        self.autostart_check = QCheckBox(autostart_label())
         form.addRow("", self.overlay_check)
         form.addRow("", self.sounds_check)
         form.addRow("", self.autostart_check)
@@ -218,8 +266,15 @@ class SettingsPanel(QWidget):
         self.cpu_check.toggled.connect(self._changed)
         form.addRow("", self.cpu_check)
         self.cpu_warning = _hint(
-            "⚠ Runs the model on the CPU instead of an NVIDIA GPU. Expect several seconds per phrase. "
-            "Use only if this PC has no supported NVIDIA GPU.",
+            (
+                "⚠ Runs the model on the CPU instead of the Metal GPU. Expect several seconds per "
+                "phrase. Use only if this Mac's GPU cannot run the model."
+            )
+            if IS_MACOS
+            else (
+                "⚠ Runs the model on the CPU instead of an NVIDIA GPU. Expect several seconds per phrase. "
+                "Use only if this PC has no supported NVIDIA GPU."
+            ),
             WARN_COLOR,
         )
         form.addRow(self.cpu_warning)  # spans both columns so it wraps at full width
@@ -399,8 +454,10 @@ class SettingsPanel(QWidget):
         cpu = self.cpu_check.isChecked()
         if model in MODELS and ct is not None:
             spec = MODELS[model]
-            vram = "runs on the CPU" if cpu else f"needs ~{spec.vram_mb[ct] / 1000:.1f} GB VRAM"
-            self.model_hint.setText(f"{vram} · {spec.download_mb / 1000:.1f} GB download")
+            memory = (
+                "runs on the CPU" if cpu else f"needs ~{spec.vram_mb[ct] / 1000:.1f} GB {MEMORY_NAME}"
+            )
+            self.model_hint.setText(f"{memory} · {download_mb(spec, ct) / 1000:.1f} GB download")
         self.compute_combo.setEnabled(not cpu)
         self.compute_combo.setToolTip("Ignored in CPU mode (always int8)." if cpu else "")
         self.cpu_warning.setStyleSheet(

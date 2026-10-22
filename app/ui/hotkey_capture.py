@@ -1,10 +1,47 @@
 """Hotkey capture field.
 
-Builds the canonical display string (contracts.Hotkey docstring) from Qt key events. The
-Windows virtual-key code (QKeyEvent.nativeVirtualKey) is preferred because it is keyboard-
-layout independent and is exactly what RegisterHotKey uses; the Qt key code is the fallback
-(synthetic events, non-Windows platforms). Validation and registration are NOT done here;
-the owner calls Controller.set_hotkey(text) on ``captured``.
+Builds the canonical display string (contracts.Hotkey docstring) from Qt key events.
+Validation and registration are NOT done here; the owner calls Controller.set_hotkey(text)
+on ``captured``.
+
+Which key code do we trust?
+---------------------------
+``QKeyEvent.nativeVirtualKey()`` is preferred on both platforms because it is keyboard-layout
+independent and is exactly what the OS hotkey API registers - but the two platforms put
+different numbers in it, and the tables collide:
+
+* Windows: a virtual-key code (VK_RETURN = 0x0D), looked up in VK_NAMES.
+* macOS:   a Carbon virtual key code (kVK_Return = 0x24), looked up in MAC_KEY_NAMES.
+  0x24 is VK_HOME on Windows, so reading a macOS event with VK_NAMES turns Return into
+  "Home". Hence the hard platform branch in key_name()/is_modifier_event().
+
+Carbon key codes describe the *physical* key (ANSI position), which is what
+``RegisterEventHotKey`` takes and what app.macos.hotkey_parse maps the canonical names onto,
+so a captured combination always fires on the very key the user pressed. On a non-ANSI
+layout the name can therefore differ from the key cap (the AZERTY "A" key is kVK_ANSI_Q);
+naming it after the character instead would register a *different* physical key, which is
+worse. ``Qt.Key_*`` (QT_KEY_NAMES) is the fallback for synthetic events (no native code) and
+for keys Carbon has no code for (e.g. Pause).
+
+Ctrl and Cmd
+------------
+Qt swaps them on macOS: ``Qt.ControlModifier`` is Command and ``Qt.MetaModifier`` is Control,
+unless ``Qt.AA_MacDontSwapCtrlAndMeta`` is set. We deliberately do **not** set that attribute
+(see app.ui.app.create_qapplication): it is process-wide, and unsetting the swap would also
+move every standard shortcut off the Command key - QKeySequence.Copy would become Control+C
+and the application menu's Quit would become Control+Q, which is wrong on a Mac. Instead
+``modifier_names()`` compensates locally: ControlModifier -> "Cmd", MetaModifier -> "Ctrl",
+AltModifier -> "Alt" (Option), ShiftModifier -> "Shift", matching contracts.Modifier.
+
+The emitted string keeps the Windows slot order (Cmd where Ctrl was, Ctrl where Win was), so
+macOS combinations read as "Cmd+Shift+D". It does not have to be in MODIFIER_ORDER: the
+owner feeds it to the platform HotkeyParser, which accepts any order and hands back the
+canonical display string that is then shown in the field.
+
+macOS eats some combinations system-wide (Cmd+Space, Cmd+Tab, Ctrl+Up, Cmd+Option+Esc...).
+Those never reach a widget, so capture simply shows nothing and keeps waiting - the user
+presses something else, or Esc to cancel. There is no Windows-style native filter to work
+around it (that one exists only for Alt+Space, which Windows turns into a system menu).
 """
 
 from __future__ import annotations
@@ -15,6 +52,8 @@ from typing import Optional
 from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtGui import QFocusEvent, QKeyEvent, QMouseEvent
 from PySide6.QtWidgets import QLineEdit
+
+from app.contracts import IS_MACOS
 
 log = logging.getLogger("roenspeak.ui.hotkey")
 
@@ -35,6 +74,32 @@ VK_NAMES: dict[int, str] = {
 
 #: Windows VKs of modifier keys (generic + left/right variants).
 MODIFIER_VKS = frozenset({0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5})
+
+#: Carbon virtual key code (kVK_*, Carbon/HIToolbox Events.h) -> canonical key name.
+#: These are physical ANSI positions, identical on every keyboard layout.
+MAC_KEY_NAMES: dict[int, str] = {
+    0x00: "A", 0x0B: "B", 0x08: "C", 0x02: "D", 0x0E: "E", 0x03: "F", 0x05: "G", 0x04: "H",
+    0x22: "I", 0x26: "J", 0x28: "K", 0x25: "L", 0x2E: "M", 0x2D: "N", 0x1F: "O", 0x23: "P",
+    0x0C: "Q", 0x0F: "R", 0x01: "S", 0x11: "T", 0x20: "U", 0x09: "V", 0x0D: "W", 0x07: "X",
+    0x10: "Y", 0x06: "Z",
+    0x1D: "0", 0x12: "1", 0x13: "2", 0x14: "3", 0x15: "4", 0x17: "5", 0x16: "6", 0x1A: "7",
+    0x1C: "8", 0x19: "9",
+    0x7A: "F1", 0x78: "F2", 0x63: "F3", 0x76: "F4", 0x60: "F5", 0x61: "F6", 0x62: "F7",
+    0x64: "F8", 0x65: "F9", 0x6D: "F10", 0x67: "F11", 0x6F: "F12", 0x69: "F13", 0x6B: "F14",
+    0x71: "F15", 0x6A: "F16", 0x40: "F17", 0x4F: "F18", 0x50: "F19", 0x5A: "F20",
+    0x31: "Space", 0x24: "Enter", 0x4C: "Enter", 0x30: "Tab", 0x35: "Esc", 0x33: "Backspace",
+    0x72: "Insert", 0x75: "Delete", 0x73: "Home", 0x77: "End", 0x74: "PageUp", 0x79: "PageDown",
+    0x7E: "Up", 0x7D: "Down", 0x7B: "Left", 0x7C: "Right",
+    0x29: ";", 0x18: "=", 0x2B: ",", 0x1B: "-", 0x2F: ".", 0x2C: "/", 0x32: "`",
+    0x21: "[", 0x2A: "\\", 0x1E: "]", 0x27: "'",
+    0x52: "Numpad0", 0x53: "Numpad1", 0x54: "Numpad2", 0x55: "Numpad3", 0x56: "Numpad4",
+    0x57: "Numpad5", 0x58: "Numpad6", 0x59: "Numpad7", 0x5B: "Numpad8", 0x5C: "Numpad9",
+}
+
+#: Carbon codes of the modifier keys (left and right Command/Shift/Option/Control, Caps
+#: Lock, Fn). Needed because they collide with the Windows table: kVK_ANSI_Keypad8 (0x5B)
+#: is VK_LWIN, so the Windows MODIFIER_VKS set would call the numpad "8" key a modifier.
+MAC_MODIFIER_KEYCODES = frozenset({0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F})
 
 _K = Qt.Key
 #: Qt key -> canonical key name (fallback when there is no native VK).
@@ -60,16 +125,21 @@ QT_MODIFIER_KEYS = frozenset(
 
 
 def modifier_names(mods: Qt.KeyboardModifier) -> list[str]:
-    """Canonical modifier names in MODIFIER_ORDER (Ctrl, Alt, Shift, Win)."""
+    """Canonical contracts.Modifier names for a Qt modifier mask.
+
+    Windows: Ctrl, Alt, Shift, Win. macOS: Cmd, Alt (Option), Shift, Ctrl - Qt swaps Ctrl and
+    Meta there (ControlModifier is Command, MetaModifier is Control), which is compensated
+    here rather than with Qt.AA_MacDontSwapCtrlAndMeta; see the module docstring.
+    """
     out = []
     if mods & Qt.ControlModifier:
-        out.append("Ctrl")
+        out.append("Cmd" if IS_MACOS else "Ctrl")
     if mods & Qt.AltModifier:
         out.append("Alt")
     if mods & Qt.ShiftModifier:
         out.append("Shift")
     if mods & Qt.MetaModifier:
-        out.append("Win")
+        out.append("Ctrl" if IS_MACOS else "Win")
     return out
 
 
@@ -91,22 +161,43 @@ def held_modifiers(event: QKeyEvent, pressed: bool) -> list[str]:
 
 
 def is_modifier_event(event: QKeyEvent) -> bool:
-    vk = event.nativeVirtualKey()
-    return int(event.key()) in QT_MODIFIER_KEYS or (vk != 0 and vk in MODIFIER_VKS)
+    """True for a press/release of a modifier key itself (Shift, Ctrl, Alt, Win/Cmd, Fn)."""
+    vk = int(event.nativeVirtualKey())
+    if int(event.key()) in QT_MODIFIER_KEYS:
+        return True
+    native = MAC_MODIFIER_KEYCODES if IS_MACOS else MODIFIER_VKS
+    return vk != 0 and vk in native
+
+
+def _qt_key_name(event: QKeyEvent) -> Optional[str]:
+    """Canonical name from the Qt key code alone (layout dependent; the fallback)."""
+    key = int(event.key())
+    name = QT_KEY_NAMES.get(key)
+    if name is None:
+        return None
+    if event.modifiers() & Qt.KeypadModifier and name.isdigit():
+        return f"Numpad{name}"
+    return name
 
 
 def key_name(event: QKeyEvent) -> Optional[str]:
-    """Canonical non-modifier key name for the event, or None if the key is not supported."""
-    vk = event.nativeVirtualKey()
+    """Canonical non-modifier key name for the event, or None if the key is not supported.
+
+    The native key code wins (layout independent, and it is what the OS hotkey API
+    registers), read through the host's own table; Qt's key code is the fallback. Never
+    guesses: an unknown key returns None and the field tells the user it cannot be used.
+    """
+    vk = int(event.nativeVirtualKey())
+    if IS_MACOS:
+        name = MAC_KEY_NAMES.get(vk)
+        # kVK_ANSI_A is 0, which is also "this event carries no native key code" (synthetic
+        # events, QTest). Only trust 0 when Qt agrees it was the A key.
+        if name is not None and not (vk == 0 and int(event.key()) != int(_K.Key_A)):
+            return name
+        return _qt_key_name(event)
     if vk and vk in VK_NAMES:
         return VK_NAMES[vk]
-    key = int(event.key())
-    if key in QT_KEY_NAMES:
-        name = QT_KEY_NAMES[key]
-        if event.modifiers() & Qt.KeypadModifier and name.isdigit():
-            return f"Numpad{name}"
-        return name
-    return None
+    return _qt_key_name(event)
 
 
 def combo_text(event: QKeyEvent) -> Optional[str]:
@@ -167,7 +258,8 @@ class HotkeyCaptureEdit(QLineEdit):
 
     def submit_native_combo(self, text: str) -> None:
         """Deliver a combination seen only at the Win32 level (e.g. Alt+Space, which Windows
-        turns into the system menu before Qt sees a key event)."""
+        turns into the system menu before Qt sees a key event). Unused on macOS, where the
+        combinations the system keeps never reach the process at all."""
         if self._capturing:
             self._finish(text)
 

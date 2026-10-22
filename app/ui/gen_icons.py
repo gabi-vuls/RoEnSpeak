@@ -3,11 +3,20 @@
     python -m app.ui.gen_icons [--out DIR]     (default DIR: <repo>/assets/icons)
 
 Writes:
-  tray_<state>_<size>.png   for every state in icon_art.TRAY_STATES and size in TRAY_SIZES
-  app_<size>.png            for every size in ICO_SIZES
-  app.ico                   multi-size icon (16..256) used by the window, PyInstaller and Inno Setup.
-                            Sizes below 256 are stored as 32-bit BMP/DIB entries with an AND mask
-                            (best compatibility with resource tools); 256 is PNG-compressed.
+  tray_<state>_<size>.png            for every state in icon_art.TRAY_STATES and size in TRAY_SIZES
+  tray_<state>_template_<size>.png   macOS status-item masks (monochrome silhouettes), for
+                                     every size in TRAY_TEMPLATE_SIZES (16 = 1x, 32 = 2x, 64 = 4x)
+  app_<size>.png                     for every size in ICO_SIZES
+  app.ico                            multi-size icon (16..256) used by the window, PyInstaller and
+                                     Inno Setup. Sizes below 256 are stored as 32-bit BMP/DIB
+                                     entries with an AND mask (best compatibility with resource
+                                     tools); 256 is PNG-compressed.
+  app.icns                           macOS app-bundle icon (CFBundleIconFile), 16..1024 px. Built
+                                     with `iconutil` when it is available (the Apple-blessed path),
+                                     otherwise with the pure-Python writer below, which produces
+                                     the same PNG-based ICNS container.
+
+Everything is deterministic: re-running overwrites the files with identical content.
 """
 
 from __future__ import annotations
@@ -15,11 +24,46 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 log = logging.getLogger("roenspeak.ui.gen_icons")
+
+#: Sizes inside app.icns. 1024 exists only as the @2x variant of 512.
+ICNS_SIZES = (16, 32, 64, 128, 256, 512, 1024)
+
+#: ICNS element type per (size, scale). The @2x types (ic11..ic14) are what Retina Macs pick;
+#: the icp4/icp5/ic07.. types are the 1x ladder. Every one of them holds a PNG.
+ICNS_ELEMENTS: tuple[tuple[bytes, int], ...] = (
+    (b"icp4", 16),    # 16x16
+    (b"icp5", 32),    # 32x32
+    (b"ic11", 32),    # 16x16@2x
+    (b"ic12", 64),    # 32x32@2x
+    (b"ic07", 128),   # 128x128
+    (b"ic13", 256),   # 128x128@2x
+    (b"ic08", 256),   # 256x256
+    (b"ic14", 512),   # 256x256@2x
+    (b"ic09", 512),   # 512x512
+    (b"ic10", 1024),  # 512x512@2x
+)
+
+#: File names inside the .iconset directory `iconutil` consumes.
+ICONSET_FILES: tuple[tuple[str, int], ...] = (
+    ("icon_16x16.png", 16),
+    ("icon_16x16@2x.png", 32),
+    ("icon_32x32.png", 32),
+    ("icon_32x32@2x.png", 64),
+    ("icon_128x128.png", 128),
+    ("icon_128x128@2x.png", 256),
+    ("icon_256x256.png", 256),
+    ("icon_256x256@2x.png", 512),
+    ("icon_512x512.png", 512),
+    ("icon_512x512@2x.png", 1024),
+)
 
 
 def _png_bytes(img) -> bytes:
@@ -73,10 +117,55 @@ def write_ico(images: list, path: Path) -> None:
     path.write_bytes(bytes(out))
 
 
+def write_icns(pngs: dict[int, bytes], path: Path) -> None:
+    """Pure-Python ICNS writer (the fallback for hosts without `iconutil`).
+
+    Container: "icns" + total length, then one element per entry: 4-byte OSType, 4-byte
+    big-endian length *including* the 8-byte element header, then the PNG. Every type used
+    here accepts a PNG payload (macOS 10.7+ / iconutil writes exactly this).
+    """
+    elements = bytearray()
+    for ostype, size in ICNS_ELEMENTS:
+        data = pngs[size]
+        elements += ostype + struct.pack(">I", len(data) + 8) + data
+    path.write_bytes(b"icns" + struct.pack(">I", len(elements) + 8) + bytes(elements))
+
+
+def build_icns(pngs: dict[int, bytes], path: Path) -> str:
+    """Write path from the rendered PNGs. Returns "iconutil" or "python" (which tool did it)."""
+    iconutil = shutil.which("iconutil")
+    if iconutil:
+        with tempfile.TemporaryDirectory() as tmp:
+            iconset = Path(tmp) / "app.iconset"
+            iconset.mkdir()
+            for name, size in ICONSET_FILES:
+                (iconset / name).write_bytes(pngs[size])
+            result = subprocess.run(
+                [iconutil, "--convert", "icns", "--output", str(path), str(iconset)],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0 and path.is_file():
+                return "iconutil"
+            log.warning(
+                "iconutil failed (rc=%d): %s; falling back to the Python writer",
+                result.returncode, (result.stderr or "").strip(),
+            )
+    write_icns(pngs, path)
+    return "python"
+
+
 def generate(out_dir: Path) -> list[Path]:
     from PySide6.QtGui import QGuiApplication
 
-    from app.ui.icon_art import ICO_SIZES, TRAY_SIZES, TRAY_STATES, render_app_icon, render_tray_icon
+    from app.ui.icon_art import (
+        ICO_SIZES,
+        TRAY_SIZES,
+        TRAY_STATES,
+        TRAY_TEMPLATE_SIZES,
+        render_app_icon,
+        render_tray_icon,
+        render_tray_template,
+    )
 
     _app = QGuiApplication.instance() or QGuiApplication(sys.argv[:1])  # noqa: F841 (needed for QPainter)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -85,6 +174,10 @@ def generate(out_dir: Path) -> list[Path]:
         for size in TRAY_SIZES:
             p = out_dir / f"tray_{state}_{size}.png"
             render_tray_icon(state, size).save(str(p), "PNG")
+            written.append(p)
+        for size in TRAY_TEMPLATE_SIZES:
+            p = out_dir / f"tray_{state}_template_{size}.png"
+            render_tray_template(state, size).save(str(p), "PNG")
             written.append(p)
     app_images = []
     for size in ICO_SIZES:
@@ -96,6 +189,10 @@ def generate(out_dir: Path) -> list[Path]:
     ico = out_dir / "app.ico"
     write_ico(app_images, ico)
     written.append(ico)
+    icns = out_dir / "app.icns"
+    tool = build_icns({size: _png_bytes(render_app_icon(size)) for size in ICNS_SIZES}, icns)
+    log.info("app.icns built with %s", tool)
+    written.append(icns)
     return written
 
 
