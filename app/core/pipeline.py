@@ -135,6 +135,34 @@ def _noop(*_a: Any, **_k: Any) -> None:
     return None
 
 
+#: Notification title per InjectionBlockedError.reason. The message itself comes from
+#: InjectionBlockedError.user_message, which contracts.py words per reason and platform.
+_BLOCKED_TITLES: dict[str, str] = {
+    # Windows
+    "elevated": "Text not typed: administrator window",
+    "unknown_integrity": "Text not typed: administrator window",
+    "sendinput_partial": "Text not typed: input blocked",
+    # macOS
+    "no_accessibility": "Text not typed: permission needed",
+    "secure_input": "Text not typed: password field",
+    "cgevent_failed": "Text not typed: input blocked",
+}
+_BLOCKED_TITLE_DEFAULT = "Text not typed"
+
+#: "sendinput_partial" is the one reason contracts.py has no specific wording for (it is a
+#: SendInput return-value mismatch, not a named OS refusal), so the cause is spelled out here.
+_SENDINPUT_PARTIAL_MESSAGE = (
+    "Windows blocked the typed input (locked screen, secure desktop or an app that "
+    "blocks simulated keys)."
+)
+
+
+def _blocked_message(exc: InjectionBlockedError) -> str:
+    if exc.reason == "sendinput_partial":
+        return _SENDINPUT_PARTIAL_MESSAGE
+    return exc.user_message
+
+
 class Pipeline:
     """Threads + queues between an AudioSource and a TextInjector.
 
@@ -490,12 +518,8 @@ class Pipeline:
                 outcome = self._injector.inject(r.text, r.session_id)
             except InjectionBlockedError as e:
                 log.warning("injection blocked (%s) for segment %d", e.reason, r.segment_id)
-                if e.reason == "sendinput_partial":
-                    self._notify("Text not typed: input blocked",
-                                 "Windows blocked the typed input (locked screen, secure desktop or an app that "
-                                 f"blocks simulated keys).\n\nText: {e.text}")
-                else:  # "elevated" / "unknown_integrity"
-                    self._notify("Text not typed: administrator window", f"{e.user_message}\n\nText: {e.text}")
+                self._notify(_BLOCKED_TITLES.get(e.reason, _BLOCKED_TITLE_DEFAULT),
+                             f"{_blocked_message(e)}\n\nText: {e.text}")
             except ModifiersHeldError as e:
                 log.warning("injection skipped for segment %d: modifiers held", r.segment_id)
                 self._notify("Text not typed: keys held down", f"{e.user_message}\n\nText: {e.text}")

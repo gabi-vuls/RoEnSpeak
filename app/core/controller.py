@@ -15,10 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import os
 import queue
-import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
@@ -26,13 +23,13 @@ from typing import Any, Callable, Optional
 
 from app.contracts import (
     DEFAULT_HOTKEY,
-    MIN_DRIVER_VERSION,
     MODELS,
     AppError,
     AppEvent,
     AppState,
     AudioSource,
     Autostart,
+    ComputeType,
     Config,
     ConfigChanged,
     ConfigError,
@@ -69,6 +66,7 @@ from app.contracts import (
     UiFacade,
     logs_dir,
 )
+from app.core import platform
 from app.core.config import JsonConfigStore, config_from_dict, config_to_dict
 from app.core.events import SimpleEventBus
 from app.core.pipeline import Pipeline
@@ -83,26 +81,26 @@ ModelKey = tuple[str, str, bool]  # (model, compute_type value, cpu_mode)
 ERROR_ACK_WINDOW_S = 5.0
 #: How long quit() waits for an in-progress model load to finish before unloading.
 QUIT_LOAD_WAIT_S = 60.0
+#: How the "GPU backend is unusable" failure is named in the log. Unchanged on Windows.
+_GPU_UNAVAILABLE = "Metal/GPU unavailable" if platform.IS_MACOS else "CUDA unavailable"
+#: Dialog title for CudaUnavailableError. MUST stay byte-identical to
+#: app.ui.dialogs.ERROR_TITLES["CudaUnavailableError"]: ErrorDialogs keys open dialogs on
+#: (title, message), and the core publishes ErrorRaised *and* calls ui.show_error for the
+#: same failure. Different titles would open two dialogs for one error.
+_GPU_ERROR_TITLE = "GPU required" if platform.IS_MACOS else "NVIDIA GPU required"
 
 
 def _model_key(cfg: Config) -> ModelKey:
     return (cfg.model, cfg.compute_type.value, cfg.cpu_mode)
 
 
-def _parse_hotkey(text: str) -> Hotkey:
-    from app.win32.hotkey_parse import parse_hotkey
-
-    return parse_hotkey(text)
-
-
-def cuda_requirement_message(error: Optional[str]) -> str:
-    return (
-        f"RoEnSpeak needs an NVIDIA GPU with driver {MIN_DRIVER_VERSION} or newer, and the CUDA "
-        f"libraries (cuBLAS, cuDNN) must load.\n\n"
-        f"Problem: {error or 'CUDA is not available.'}\n\n"
-        f"Install or update the NVIDIA driver, then restart RoEnSpeak. If this PC has no NVIDIA GPU, "
-        f"you can enable \"CPU mode (slow)\" in Settings."
-    )
+def download_size_mb(model: str, compute_type: ComputeType) -> int:
+    """Download size for the download dialog: the CTranslate2 model directory on Windows, the
+    single ggml file the macOS engine loads (which depends on the compute type) on macOS."""
+    spec = MODELS[model]
+    if platform.IS_MACOS:
+        return int(spec.ggml_mb.get(compute_type, spec.download_mb))
+    return spec.download_mb
 
 
 class AppController:
@@ -202,6 +200,15 @@ class AppController:
         return self._last_latency_ms
 
     @property
+    def single_instance(self) -> Optional[SingleInstance]:
+        """The single-instance guard, so the UI can hook "another launch asked us to show
+        the window". On Windows that arrives as a broadcast window message the UI's native
+        event filter already sees; on macOS FileLockSingleInstance calls an on_show_window
+        callback from the socket thread it listens on, and app/ui/app.py sets that callback
+        here. Read-only: lifetime stays with whoever constructed it (app/main.py)."""
+        return self._single_instance
+
+    @property
     def bus(self) -> EventBus:
         return self._bus
 
@@ -223,7 +230,7 @@ class AppController:
         self._post(self._toggle)
 
     def set_hotkey(self, text: str) -> Hotkey:
-        hk = _parse_hotkey(text)  # HotkeyParseError propagates
+        hk = platform.parse_hotkey(text)  # HotkeyParseError propagates
         with self._lock:
             self._register_checked(hk)  # HotkeyConflictError propagates; previous stays
             new = dataclasses.replace(self._config, hotkey=hk.display)
@@ -265,7 +272,7 @@ class AppController:
             if not self._hotkey_registered or mgr is None or self._quitting:
                 return
             try:
-                hk = _parse_hotkey(self._config.hotkey)
+                hk = platform.parse_hotkey(self._config.hotkey)
                 mgr.register(hk)
                 log.info("hotkey resumed: %s", hk.display)
             except (HotkeyConflictError, HotkeyParseError) as e:
@@ -286,7 +293,7 @@ class AppController:
             old = self._config
             hotkey_changed = validated.hotkey != old.hotkey
             if hotkey_changed:
-                self._register_checked(_parse_hotkey(validated.hotkey))  # HotkeyConflictError propagates
+                self._register_checked(platform.parse_hotkey(validated.hotkey))  # HotkeyConflictError propagates
             # Arming is applied asynchronously by _arm/_disarm, which persist it themselves.
             new = dataclasses.replace(validated, armed=old.armed)
             self._store.save(new)
@@ -322,10 +329,7 @@ class AppController:
         folder = logs_dir()
         try:
             folder.mkdir(parents=True, exist_ok=True)
-            if sys.platform == "win32":
-                os.startfile(str(folder))  # type: ignore[attr-defined]
-            else:
-                subprocess.Popen(["xdg-open", str(folder)])
+            platform.open_folder(folder)
         except OSError as e:
             log.error("could not open log folder %s: %s", folder, e)
             self._publish(Notification("Could not open the log folder", f"{folder}\n{e}", warning=True))
@@ -424,20 +428,18 @@ class AppController:
                 self._request_load()  # model stays resident while disarmed; arming is then instant
 
     def _build_components(self) -> None:
+        """Creates every component the caller did not inject, through app.core.platform so
+        the choice of platform layer lives in exactly one module."""
         cfg = self._config
         if self._probe is None:
-            from app.engine.cuda_probe import WindowsCudaProbe
-
-            self._probe = WindowsCudaProbe()
+            self._probe = platform.make_probe()
             self._probe.setup_dll_paths()
         if self._engine is None:
-            from app.engine.engine import WhisperEngine
-
-            self._engine = WhisperEngine(self._probe)
+            self._engine = platform.make_engine(self._probe)
         if self._downloader is None:
-            from app.engine.downloader import HfModelDownloader
-
-            self._downloader = HfModelDownloader()
+            self._downloader = platform.make_downloader()
+        # macOS: the ggml downloader picks its model file from the compute type.
+        self._sync_downloader_compute_type(cfg)
         if self._filter is None:
             from app.engine.filter import ThresholdHallucinationFilter
 
@@ -448,23 +450,15 @@ class AppController:
 
             self._segmenter = VadSegmenter(cfg.vad, SileroStreamingVad())
         if (self._injector is None or self._hotkey_factory is None) and self._api is None:
-            from app.win32._winapi import RealWinApi
-
-            self._api = RealWinApi()
+            self._api = platform.make_api()
         if self._injector is None:
-            from app.win32.clipboard import Win32Clipboard
-            from app.win32.injector import Win32TextInjector
-
-            self._injector = Win32TextInjector(self._api, Win32Clipboard(self._api), mode=cfg.injection_mode)
+            self._injector = platform.make_injector(
+                self._api, platform.make_clipboard(self._api), cfg.injection_mode
+            )
         if self._autostart is None:
-            from app.win32.autostart import RunKeyAutostart
-
-            self._autostart = RunKeyAutostart()
+            self._autostart = platform.make_autostart()
         if self._hotkey_factory is None:
-            from app.win32.hotkey import Win32HotkeyManager
-
-            api = self._api
-            self._hotkey_factory = lambda on_fire: Win32HotkeyManager(api, on_fire)
+            self._hotkey_factory = platform.make_hotkey_factory(self._api)
         self._hotkey_mgr = self._hotkey_factory(self._on_hotkey_fire)
         self._hotkey_mgr.start()
 
@@ -500,15 +494,16 @@ class AppController:
 
     def _sync_autostart(self, enabled: bool) -> None:
         """Only called when the user changes ui.start_with_windows; never at startup, so an
-        isolated/test config can't touch the user's real Run key."""
+        isolated/test config can't touch the user's real Run key / LaunchAgent."""
         if self._autostart is None:
             return
+        label = platform.autostart_label()
         try:
             self._autostart.set_enabled(enabled)
-            log.info("start with Windows: %s", enabled)
+            log.info("%s: %s", label.lower(), enabled)
         except Exception as e:
             log.exception("autostart update failed")
-            self._publish(ErrorRaised(type(e).__name__, "Could not change the \"Start with Windows\" setting.",
+            self._publish(ErrorRaised(type(e).__name__, f"Could not change the \"{label}\" setting.",
                                       details=str(e), fatal=False))
 
     # ------------------------------------------------------------------
@@ -530,17 +525,17 @@ class AppController:
 
     def _cuda_failure(self, error: Optional[str], details: str = "") -> None:
         """CUDA probe failed: explain the requirement around the probe's reason."""
-        log.error("CUDA unavailable: %s", error)
+        log.error("%s: %s", _GPU_UNAVAILABLE, error)
         # Same (title, message) as the UI uses for ErrorRaised -> the UI shows a single dialog.
-        self._enter_error("CudaUnavailableError", cuda_requirement_message(error), details or (error or ""),
-                          dialog_title="NVIDIA GPU required")
+        self._enter_error("CudaUnavailableError", platform.gpu_requirement_message(error),
+                          details or (error or ""), dialog_title=_GPU_ERROR_TITLE)
 
     def _cuda_engine_error(self, exc: CudaUnavailableError) -> None:
         """The engine raised a CUDA error; its user_message is already user-facing."""
         oom = isinstance(exc, GpuOutOfMemoryError)
         log.error("%s: %s (%s)", type(exc).__name__, exc.user_message, exc.details)
         self._enter_error(type(exc).__name__, exc.user_message, exc.details,
-                          dialog_title="Not enough GPU memory" if oom else "NVIDIA GPU required")
+                          dialog_title="Not enough GPU memory" if oom else _GPU_ERROR_TITLE)
 
     # ------------------------------------------------------------------
     # Arm / disarm
@@ -564,7 +559,7 @@ class AppController:
                     return
             if not self._hotkey_registered:
                 try:
-                    hk = _parse_hotkey(cfg.hotkey)
+                    hk = platform.parse_hotkey(cfg.hotkey)
                     if not self._hotkey_suspended:
                         self._hotkey_mgr.register(hk)
                 except (HotkeyConflictError, HotkeyParseError) as e:
@@ -733,7 +728,7 @@ class AppController:
                     and self._sm.state != AppState.ERROR:
                 log.warning("model %s missing but state %s cannot go to ERROR", model, self._sm.state.value)
         log.info("model %s is not downloaded; showing download dialog", model)
-        self._ui.show_download_dialog(model, MODELS[model].download_mb)
+        self._ui.show_download_dialog(model, download_size_mb(model, self._config.compute_type))
 
     def _start_download(self) -> None:
         with self._lock:
@@ -847,7 +842,7 @@ class AppController:
         model = self._config.model
         if self._model_missing == model and not self._downloader.is_downloaded(model):
             log.info("hotkey in ERROR: model %s missing; re-showing download dialog", model)
-            self._ui.show_download_dialog(model, MODELS[model].download_mb)
+            self._ui.show_download_dialog(model, download_size_mb(model, self._config.compute_type))
             return
         t_abort = self._t_error_abort
         if t_abort is not None and time.perf_counter() - t_abort < ERROR_ACK_WINDOW_S:
@@ -975,7 +970,16 @@ class AppController:
     # Config application
     # ------------------------------------------------------------------
 
+    def _sync_downloader_compute_type(self, cfg: Config) -> None:
+        """macOS: GgmlModelDownloader resolves the ggml file from the compute type, so it has
+        to follow Config.compute_type. No-op for downloaders without the hook (Windows)."""
+        dl = self._downloader
+        if dl is not None and hasattr(dl, "set_compute_type"):
+            dl.set_compute_type(cfg.compute_type)
+
     def _apply_live(self, old: Config, new: Config) -> None:
+        if new.compute_type != old.compute_type:
+            self._sync_downloader_compute_type(new)
         if new.injection_mode != old.injection_mode and self._injector is not None:
             self._injector.set_mode(new.injection_mode)
         if new.filter != old.filter and self._filter is not None:
