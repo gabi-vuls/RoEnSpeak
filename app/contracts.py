@@ -45,12 +45,29 @@ APP_NAME = "RoEnSpeak"
 APP_VERSION = "0.1.0"
 SAMPLE_RATE = 16_000
 VAD_FRAME_SAMPLES = 512  # 32 ms at 16 kHz; Silero v6 frame size used by faster-whisper
-DEFAULT_HOTKEY = "Alt+Q"
+DEFAULT_HOTKEY = "Alt+Q"  # Windows: Alt+Q, macOS: Option+Q (same string, see Modifier)
 SOURCE_LANGUAGE = "ro"
+
+#: Host platform switches. Platform code lives in app/win32 (Windows) and app/macos (macOS);
+#: app.core.platform is the only module that chooses between them.
+IS_WINDOWS = sys.platform == "win32"
+IS_MACOS = sys.platform == "darwin"
+
+
+def os_display_name() -> str:
+    """"Windows" / "macOS" / "the system", for user-facing messages."""
+    if IS_WINDOWS:
+        return "Windows"
+    if IS_MACOS:
+        return "macOS"
+    return "the system"
 
 #: Minimum NVIDIA driver for CUDA 12.x minor-version compatibility on Windows.
 #: The definitive check is CudaProbe actually loading cuBLAS/cuDNN.
 MIN_DRIVER_VERSION = "528.33"
+
+#: Minimum macOS version. Metal 3 + the Carbon hotkey and CGEvent APIs the macOS layer uses.
+MIN_MACOS_VERSION = "13.0"
 
 #: Registered window message (RegisterWindowMessageW) a second instance broadcasts
 #: to ask the running instance to show its main window.
@@ -64,11 +81,20 @@ VK_MENU_MASK = 0xE8
 LOG_ENGINE_LOADED = "engine_loaded"  # device= compute_type= model= gpu= driver= cublas= cudnn= load_ms=
 LOG_SEGMENT_LATENCY = "segment_latency"  # session= id= reason= audio_ms= infer_ms= latency_ms= chars= filtered=
 LOG_CUDA_PROBE = "cuda_probe"  # ok= gpu= driver= cublas= cudnn= error=
+#: The macOS Metal probe emits the same key with cublas=none cudnn=none, so log greps are shared.
 
 
 class ComputeType(str, enum.Enum):
-    FLOAT16 = "float16"
-    INT8_FLOAT16 = "int8_float16"
+    """Quantization of the loaded model. The values are ctranslate2 compute types (Windows).
+
+    On macOS whisper.cpp has no runtime compute type: the quantization is baked into the
+    ggml model file, so the same two choices select a different file (see ModelSpec.ggml_file)
+    and EngineInfo.compute_type reports the real ggml type ("f16" / "q5_0"). Keeping the enum
+    unchanged keeps one config.json valid on both platforms.
+    """
+
+    FLOAT16 = "float16"  # macOS: ggml f16
+    INT8_FLOAT16 = "int8_float16"  # macOS: ggml q5_0
 
 
 #: Compute type the engine always uses in CPU mode. CPU mode ignores Config.compute_type.
@@ -152,7 +178,12 @@ class ModelSpec:
     """A selectable Whisper model.
 
     vram_mb is the approximate peak VRAM for load + beam-5 inference on a <=15 s segment,
-    including CUDA context overhead. The engine warns if total VRAM is below it.
+    including CUDA context overhead. The engine warns if total VRAM is below it. On macOS
+    (unified memory) it is read as "approximate peak memory for the Metal backend".
+
+    hf_repo / download_mb describe the CTranslate2 model the Windows engine loads.
+    ggml_file / ggml_mb describe the single-file ggml model the macOS whisper.cpp engine
+    loads from GGML_REPO, per compute type.
     """
 
     name: str
@@ -161,25 +192,35 @@ class ModelSpec:
     download_mb: int
     vram_mb: Mapping[ComputeType, int]
     label: str
+    ggml_file: Mapping[ComputeType, str] = field(default_factory=dict)
+    ggml_mb: Mapping[ComputeType, int] = field(default_factory=dict)
 
 
 MODELS: Mapping[str, ModelSpec] = {
     "large-v3": ModelSpec(
         "large-v3", "Systran/faster-whisper-large-v3", True, 3100,
         {ComputeType.FLOAT16: 4700, ComputeType.INT8_FLOAT16: 3100}, "large-v3 (best quality)",
+        {ComputeType.FLOAT16: "ggml-large-v3.bin", ComputeType.INT8_FLOAT16: "ggml-large-v3-q5_0.bin"},
+        {ComputeType.FLOAT16: 3095, ComputeType.INT8_FLOAT16: 1080},
     ),
     "large-v2": ModelSpec(
         "large-v2", "Systran/faster-whisper-large-v2", True, 3100,
         {ComputeType.FLOAT16: 4700, ComputeType.INT8_FLOAT16: 3100}, "large-v2",
+        {ComputeType.FLOAT16: "ggml-large-v2.bin", ComputeType.INT8_FLOAT16: "ggml-large-v2-q5_0.bin"},
+        {ComputeType.FLOAT16: 3094, ComputeType.INT8_FLOAT16: 1080},
     ),
     "medium": ModelSpec(
         "medium", "Systran/faster-whisper-medium", True, 1530,
         {ComputeType.FLOAT16: 2600, ComputeType.INT8_FLOAT16: 1800}, "medium (faster, lower quality)",
+        {ComputeType.FLOAT16: "ggml-medium.bin", ComputeType.INT8_FLOAT16: "ggml-medium-q5_0.bin"},
+        {ComputeType.FLOAT16: 1533, ComputeType.INT8_FLOAT16: 539},
     ),
     # Not trained for translation; offered only for Task.TRANSCRIBE.
     "large-v3-turbo": ModelSpec(
         "large-v3-turbo", "mobiuslabsgmbh/faster-whisper-large-v3-turbo", False, 1620,
         {ComputeType.FLOAT16: 2600, ComputeType.INT8_FLOAT16: 1800}, "large-v3-turbo (transcription only)",
+        {ComputeType.FLOAT16: "ggml-large-v3-turbo.bin", ComputeType.INT8_FLOAT16: "ggml-large-v3-turbo-q5_0.bin"},
+        {ComputeType.FLOAT16: 1624, ComputeType.INT8_FLOAT16: 574},
     ),
 }
 DEFAULT_MODEL = "large-v3"
@@ -192,6 +233,20 @@ MODEL_ALLOW_PATTERNS = ("config.json", "preprocessor_config.json", "model.bin", 
 #: Marker file the downloader writes into the model directory after all files are verified.
 MODEL_COMPLETE_MARKER = ".download_complete"
 
+#: Hugging Face repo holding the single-file ggml Whisper models whisper.cpp loads (macOS).
+GGML_REPO = "ggerganov/whisper.cpp"
+
+
+def ggml_model_file(model: str, compute_type: ComputeType) -> str:
+    """File name inside GGML_REPO for this model/compute type. ValueError if unknown."""
+    spec = MODELS.get(model)
+    if spec is None:
+        raise ValueError(f"Unknown model: {model!r}")
+    name = spec.ggml_file.get(ComputeType(compute_type))
+    if not name:
+        raise ValueError(f"No ggml model file for {model!r} / {compute_type!r}")
+    return name
+
 
 # ---------------------------------------------------------------------------
 # Paths (env overrides exist so tests and the desktop test can isolate state)
@@ -203,11 +258,14 @@ ENV_MODELS_DIR = "ROENSPEAK_MODELS_DIR"
 
 
 def config_dir() -> Path:
-    """%APPDATA%\\RoEnSpeak, or $ROENSPEAK_CONFIG_DIR, or ~/.config/RoEnSpeak off Windows."""
+    """$ROENSPEAK_CONFIG_DIR, else %APPDATA%\\RoEnSpeak (Windows),
+    ~/Library/Application Support/RoEnSpeak (macOS), ~/.config/RoEnSpeak elsewhere."""
     if os.environ.get(ENV_CONFIG_DIR):
         return Path(os.environ[ENV_CONFIG_DIR])
-    if sys.platform == "win32" and os.environ.get("APPDATA"):
+    if IS_WINDOWS and os.environ.get("APPDATA"):
         return Path(os.environ["APPDATA"]) / APP_NAME
+    if IS_MACOS:
+        return Path.home() / "Library" / "Application Support" / APP_NAME
     return Path.home() / ".config" / APP_NAME
 
 
@@ -216,11 +274,14 @@ def config_path() -> Path:
 
 
 def data_dir() -> Path:
-    """%LOCALAPPDATA%\\RoEnSpeak, or $ROENSPEAK_DATA_DIR, or ~/.local/share/RoEnSpeak off Windows."""
+    """$ROENSPEAK_DATA_DIR, else %LOCALAPPDATA%\\RoEnSpeak (Windows),
+    ~/Library/Application Support/RoEnSpeak (macOS), ~/.local/share/RoEnSpeak elsewhere."""
     if os.environ.get(ENV_DATA_DIR):
         return Path(os.environ[ENV_DATA_DIR])
-    if sys.platform == "win32" and os.environ.get("LOCALAPPDATA"):
+    if IS_WINDOWS and os.environ.get("LOCALAPPDATA"):
         return Path(os.environ["LOCALAPPDATA"]) / APP_NAME
+    if IS_MACOS:
+        return Path.home() / "Library" / "Application Support" / APP_NAME
     return Path.home() / ".local" / "share" / APP_NAME
 
 
@@ -232,17 +293,28 @@ def models_dir() -> Path:
 
 
 def logs_dir() -> Path:
+    """data_dir()/logs, except ~/Library/Logs/RoEnSpeak on macOS. $ROENSPEAK_DATA_DIR wins,
+    so an isolated instance always keeps its logs next to its data."""
+    if IS_MACOS and not os.environ.get(ENV_DATA_DIR):
+        return Path.home() / "Library" / "Logs" / APP_NAME
     return data_dir() / "logs"
 
 
 def single_instance_name() -> str:
     """Named-mutex name. When ROENSPEAK_CONFIG_DIR is set, it gets a suffix so an isolated
     test instance can run next to the user's real instance."""
-    base = f"Local\\{APP_NAME}.SingleInstance"
+    base = f"Local\\{APP_NAME}.SingleInstance" if IS_WINDOWS else f"{APP_NAME}.SingleInstance"
     override = os.environ.get(ENV_CONFIG_DIR)
     if override:
         return base + "." + hashlib.sha1(override.encode("utf-8")).hexdigest()[:12]
     return base
+
+
+def single_instance_lock_path() -> Path:
+    """macOS lock file (flock) standing in for the Windows named mutex. The sibling
+    ".sock" path is the Unix socket the running instance listens on for "show window"."""
+    name = single_instance_name().replace("\\", ".")
+    return data_dir() / f"{name}.lock"
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +332,10 @@ class AppError(Exception):
 
 
 class CudaUnavailableError(AppError):
-    """No usable NVIDIA GPU / driver too old / cuBLAS or cuDNN DLLs failed to load.
+    """The GPU backend is unusable, so SpeechEngine.load failed.
+
+    Windows: no usable NVIDIA GPU, driver too old, or cuBLAS/cuDNN failed to load.
+    macOS:   the Metal backend or the whisper.cpp dynamic library could not be initialised.
 
     Raised by SpeechEngine.load when cpu_mode is False. The engine never falls back to
     CPU on its own.
@@ -309,40 +384,70 @@ class HotkeyParseError(AppError):
 
 
 class HotkeyConflictError(AppError):
-    """RegisterHotKey failed (usually another app or the OS owns the combo)."""
+    """RegisterHotKey (Windows) / RegisterEventHotKey (macOS) failed: another app or the OS
+    owns the combo. ``win32_error`` carries GetLastError on Windows and the OSStatus on macOS."""
 
-    def __init__(self, hotkey: str, *, win32_error: int = 0) -> None:
+    def __init__(self, hotkey: str, *, win32_error: int = 0, details: str = "") -> None:
+        api = "RegisterHotKey failed, GetLastError" if IS_WINDOWS else "RegisterEventHotKey failed, OSStatus"
         super().__init__(
-            f"{hotkey} is already in use by another application or by Windows. Choose a different combination.",
-            details=f"RegisterHotKey failed, GetLastError={win32_error}",
+            f"{hotkey} is already in use by another application or by {os_display_name()}. "
+            "Choose a different combination.",
+            details=details or f"{api}={win32_error}",
         )
         self.hotkey = hotkey
         self.win32_error = win32_error
 
 
 class InjectionBlockedError(AppError):
-    """The foreground window runs at a higher integrity level than us (elevated/admin), or
-    its integrity could not be determined, so UIPI would silently drop SendInput.
+    """The OS refused the synthetic keystrokes, so the text was NOT typed.
 
-    ``text`` holds the text that was NOT injected, so the UI can show it to the user.
+    ``text`` holds the text that was not injected, so the UI can show it to the user.
+    ``reason`` is one of:
+
+    Windows  "elevated" / "unknown_integrity"  the foreground window runs at a higher
+             integrity level than us (or it could not be read), so UIPI would silently
+             drop SendInput; "sendinput_partial"  SendInput inserted fewer events.
+    macOS    "no_accessibility"  Accessibility permission is not granted, so CGEventPost
+             is ignored; "secure_input"  the focused field uses secure event input (a
+             password field), which blocks synthetic keystrokes; "cgevent_failed"  the
+             event could not be created or posted.
+
+    ``user_message`` is derived from ``reason``, so every platform explains the real cause.
     """
 
-    def __init__(self, text: str, *, reason: str) -> None:
-        super().__init__(
+    MESSAGES = {
+        "elevated": (
             "Can't type into an administrator window. Run the target app without admin rights, "
-            "or start RoEnSpeak as administrator.",
-            details=f"reason={reason}",
-        )
+            "or start RoEnSpeak as administrator."
+        ),
+        "unknown_integrity": (
+            "Can't type into an administrator window. Run the target app without admin rights, "
+            "or start RoEnSpeak as administrator."
+        ),
+        "no_accessibility": (
+            "RoEnSpeak needs Accessibility permission to type. Open System Settings > Privacy & "
+            "Security > Accessibility and switch RoEnSpeak on, then try again."
+        ),
+        "secure_input": (
+            "Can't type into a password field (macOS blocks synthetic keystrokes there). "
+            "Click into a normal text field and dictate again."
+        ),
+    }
+    DEFAULT_MESSAGE = "The text could not be typed into the focused window."
+
+    def __init__(self, text: str, *, reason: str) -> None:
+        super().__init__(self.MESSAGES.get(reason, self.DEFAULT_MESSAGE), details=f"reason={reason}")
         self.text = text
         self.reason = reason
 
 
 class ModifiersHeldError(AppError):
-    """Ctrl/Shift/Alt/Win were still physically held after the wait timeout; nothing was
+    """Modifier keys were still physically held after the wait timeout; nothing was
     injected (typing with modifiers held would trigger shortcuts). ``text`` holds the dropped text."""
 
     def __init__(self, text: str) -> None:
-        super().__init__("Release Ctrl/Shift/Alt/Win so the dictated text can be typed.")
+        keys = "Ctrl/Shift/Alt/Win" if IS_WINDOWS else "Control/Shift/Option/Command"
+        super().__init__(f"Release {keys} so the dictated text can be typed.")
         self.text = text
 
 
@@ -785,14 +890,24 @@ class ThreadingEvent(Protocol):
 
 
 class Modifier(str, enum.Enum):
+    """Hotkey modifiers. CTRL/ALT/SHIFT exist on both platforms; WIN and CMD are the
+    platform-specific "super" key.
+
+    The Windows parser accepts Ctrl/Alt/Shift/Win and never produces CMD. The macOS parser
+    accepts the same names plus Cmd/Command/Option/Opt, maps Win|Windows|Meta|Super|Cmd ->
+    CMD and Alt|Option|Opt -> ALT, and never produces WIN. So "Alt+Q" is a valid hotkey on
+    both (Alt+Q / Option+Q) and one config.json works on both platforms.
+    """
+
     CTRL = "Ctrl"
-    ALT = "Alt"
+    ALT = "Alt"  # macOS: Option
     SHIFT = "Shift"
-    WIN = "Win"
+    WIN = "Win"  # Windows only
+    CMD = "Cmd"  # macOS only
 
 
 #: Canonical modifier order in display strings.
-MODIFIER_ORDER = (Modifier.CTRL, Modifier.ALT, Modifier.SHIFT, Modifier.WIN)
+MODIFIER_ORDER = (Modifier.CTRL, Modifier.ALT, Modifier.SHIFT, Modifier.WIN, Modifier.CMD)
 #: RegisterHotKey fsModifiers bits.
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x8, 0x4000
 
@@ -808,13 +923,15 @@ class Hotkey:
       PageDown (PgDn), Up, Down, Left, Right, Pause, Numpad0-Numpad9,
       OEM punctuation by character: ; = , - . / ` [ \\ ] '
     Modifier aliases: Ctrl (Control, Ctl), Alt, Shift, Win (Windows, Meta, Super).
+    On macOS: Alt (Option, Opt) and Cmd (Command, Win, Windows, Meta, Super); the macOS
+    key table maps the same canonical key names onto Carbon kVK_* codes.
     Separators: "+" with optional surrounding whitespace. "Ctrl++" is not supported;
     use "=" or "-" style keys only.
     """
 
     modifiers: frozenset[Modifier]
     key: str  # canonical key name
-    vk: int  # Windows virtual-key code
+    vk: int  # Windows virtual-key code; on macOS the Carbon virtual key code (kVK_*)
 
     @property
     def display(self) -> str:
@@ -824,7 +941,13 @@ class Hotkey:
     @property
     def win32_modifiers(self) -> int:
         """fsModifiers for RegisterHotKey, always including MOD_NOREPEAT."""
-        bits = {Modifier.ALT: MOD_ALT, Modifier.CTRL: MOD_CONTROL, Modifier.SHIFT: MOD_SHIFT, Modifier.WIN: MOD_WIN}
+        bits = {
+            Modifier.ALT: MOD_ALT,
+            Modifier.CTRL: MOD_CONTROL,
+            Modifier.SHIFT: MOD_SHIFT,
+            Modifier.WIN: MOD_WIN,
+            Modifier.CMD: MOD_WIN,  # never produced by the Windows parser; kept total
+        }
         value = MOD_NOREPEAT
         for m in self.modifiers:
             value |= bits[m]
@@ -968,7 +1091,10 @@ class HotkeyManager(Protocol):
 
 @dataclass(frozen=True)
 class ClipboardSnapshot:
-    formats: tuple[tuple[int, bytes], ...]  # (format id, raw bytes) in enumeration order
+    """Saved clipboard contents. Format ids are ints on Windows (CF_*) and UTI strings on
+    macOS (NSPasteboard types); only the platform clipboard backend interprets them."""
+
+    formats: tuple[tuple[Union[int, str], bytes], ...]  # (format id, raw bytes) in enumeration order
 
 
 @runtime_checkable
@@ -1264,11 +1390,18 @@ class UiFacade(Protocol):
 #     (any sample rate / channel count wav; converted to 16 kHz mono float32)
 # app.audio.wavsource.read_wav_16k_mono(path) -> np.ndarray
 #
-# app.engine.cuda_probe.WindowsCudaProbe()                   -> CudaProbe
+# app.engine.cuda_probe.WindowsCudaProbe()                   -> CudaProbe   (Windows)
+# app.engine.metal_probe.MetalProbe()                        -> CudaProbe   (macOS; setup_dll_paths() -> [],
+#     probe() reports the Apple chip, unified memory and the whisper.cpp/Metal availability, never raises)
 # app.engine.filter.ThresholdHallucinationFilter(cfg: FilterConfig) -> HallucinationFilter
 #     app.engine.filter.normalize_text(text: str) -> str
 # app.engine.engine.WhisperEngine(probe: CudaProbe, models_root: Path | None = None) -> SpeechEngine
+#     (Windows: faster-whisper / CTranslate2 on CUDA)
+# app.engine.whispercpp.WhisperCppEngine(probe: CudaProbe | None = None, models_root: Path | None = None)
+#     -> SpeechEngine  (macOS: whisper.cpp on Metal through libroenspeak_whisper.dylib)
 # app.engine.downloader.HfModelDownloader(models_root: Path | None = None) -> ModelDownloader
+# app.engine.ggml_downloader.GgmlModelDownloader(models_root: Path | None = None, compute_type=FLOAT16)
+#     -> ModelDownloader  (macOS: one ggml_model_file() from GGML_REPO + MODEL_COMPLETE_MARKER)
 # app.engine.gpu.vram_warning(gpu: GpuInfo, model: str, compute_type: ComputeType) -> Optional[str]
 #     (message suggesting int8_float16 when gpu.total_vram_mb < MODELS[model].vram_mb[compute_type])
 #
@@ -1282,6 +1415,24 @@ class UiFacade(Protocol):
 # app.win32.instance.NamedMutexSingleInstance(api: WinApi, name: str | None = None) -> SingleInstance
 # app.win32.autostart.RunKeyAutostart(command: str | None = None) -> Autostart
 #
+# app.macos._mac_api.RealMacApi()                            -> the macOS counterpart of WinApi
+# app.macos.hotkey_parse.parse_hotkey(text) -> Hotkey ; format_hotkey(h) -> str
+#     app.macos.hotkey_parse.MacHotkeyStringParser()          -> HotkeyParser
+# app.macos.hotkey.MacHotkeyManager(api, on_fire: Callable[[], None], debounce_s=0.3) -> HotkeyManager
+#     (Carbon RegisterEventHotKey on the main run loop; no Alt-menu suppression needed)
+# app.macos.clipboard.MacClipboard(api)                      -> ClipboardBackend  (NSPasteboard)
+# app.macos.injector.MacTextInjector(api, clipboard, mode=InjectionMode.SENDINPUT,
+#     modifier_timeout_s=5.0, poll_s=0.01, paste_settle_s=0.15) -> TextInjector
+#     (CGEventKeyboardSetUnicodeString; secure-input and Accessibility checks replace UIPI)
+# app.macos.instance.FileLockSingleInstance(api=None, name: str | None = None) -> SingleInstance
+#     (flock on single_instance_lock_path() + a Unix socket for "show window")
+# app.macos.autostart.LaunchAgentAutostart(command: str | None = None) -> Autostart
+#     (~/Library/LaunchAgents/com.roenspeak.RoEnSpeak.plist with RunAtLoad)
+# app.macos.permissions  -> accessibility/microphone permission checks and prompts
+#
+# app.core.platform  -- the ONLY platform dispatch. parse_hotkey/format_hotkey plus
+#     make_probe/make_engine/make_downloader/make_api/make_clipboard/make_injector/
+#     make_autostart/make_hotkey_factory/make_single_instance/open_folder/gpu_requirement_message.
 # app.core.config.JsonConfigStore(path: Path | None = None)  -> ConfigStore
 #     app.core.config.config_to_dict(cfg) -> dict ; config_from_dict(raw) -> tuple[Config, list[str]]
 #     app.core.config.migrate(raw: dict) -> dict   (any schema -> current schema dict; pure)
