@@ -98,7 +98,11 @@ def test_default_lock_path_comes_from_the_contract(instance_dir):
     assert inst.name == contracts.single_instance_name()
     assert inst.lock_path == contracts.single_instance_lock_path()
     assert inst.lock_path.parent == instance_dir
-    assert inst.socket_path == inst.lock_path.with_suffix(".sock")
+    if len(str(inst.lock_path.with_suffix(".sock")).encode()) <= AF_UNIX_PATH_MAX - 1:
+        assert inst.socket_path == inst.lock_path.with_suffix(".sock")
+    else:
+        # Too deep a data dir falls back to a short path; see the test below.
+        assert len(str(inst.socket_path).encode()) <= AF_UNIX_PATH_MAX - 1
 
 
 def test_the_test_socket_path_fits_the_af_unix_limit(instance):
@@ -302,28 +306,38 @@ def test_an_unrelated_lock_failure_is_logged_and_the_app_still_runs(instance_dir
     inst.release()
 
 
-def test_deep_data_dir_keeps_the_lock_but_loses_show_window(tmp_path, monkeypatch):
-    """A data dir too deep for AF_UNIX degrades gracefully: the lock still works, only the
-    "show window" channel is unavailable."""
+def test_deep_data_dir_still_delivers_show_window(tmp_path, monkeypatch):
+    """A data dir too deep for AF_UNIX must not cost us the "show window" channel.
+
+    sun_path is 104 bytes, and macOS's own $TMPDIR is already ~48 of them, so the sibling
+    socket path is unbindable for any isolated or deeply nested data dir. That used to fail
+    open and silently: the lock still worked, a second launch still exited 0, and the user's
+    window just never came to the front. Both sides now derive the same short fallback path
+    from the lock path, so the ping keeps working."""
     deep = tmp_path / ("d" * 60) / ("e" * 60)
     deep.mkdir(parents=True)
     monkeypatch.setenv(contracts.ENV_DATA_DIR, str(deep))
 
     inst = FileLockSingleInstance(name=NAME)
-    assert len(str(inst.socket_path).encode()) > AF_UNIX_PATH_MAX
+    assert len(str(inst.lock_path.with_suffix(".sock")).encode()) > AF_UNIX_PATH_MAX
+    assert len(str(inst.socket_path).encode()) <= AF_UNIX_PATH_MAX - 1
+    assert inst.socket_path.parent != inst.lock_path.parent
     seen = threading.Event()
     inst.on_show_window = seen.set
     try:
         assert inst.acquire() is True
         assert inst.lock_path.exists()
-        assert not inst.socket_path.exists(), "no socket could be bound"
+        assert inst.socket_path.exists(), "the fallback socket must be bound"
 
         second = FileLockSingleInstance(name=NAME)
+        # Both instances derive the same fallback path from the same lock path.
+        assert second.socket_path == inst.socket_path
         assert second.acquire() is False, "the lock itself must still hold"
-        second.notify_existing()  # unreachable, but quiet
-        assert not seen.is_set()
+        second.notify_existing()
+        assert seen.wait(3.0), "the show-window ping must reach the running instance"
     finally:
         inst.release()
+    assert not inst.socket_path.exists(), "release() must unlink the fallback socket too"
 
     after = FileLockSingleInstance(name=NAME)
     try:

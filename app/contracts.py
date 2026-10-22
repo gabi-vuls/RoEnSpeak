@@ -819,11 +819,17 @@ class SpeechEngine(Protocol):
     single inference thread.
 
     load(model, compute_type, cpu_mode):
-      Blocking. Unloads any previous model first. Loads models_dir()/<model> with
-      local_files_only. device="cuda" + compute_type, or, only if cpu_mode, device="cpu" +
-      CPU_COMPUTE_TYPE. Logs LOG_ENGINE_LOADED. Raises CudaUnavailableError (cpu_mode False
-      and CUDA probe failed or ctranslate2 raised a CUDA/cuDNN/cuBLAS error),
-      ModelNotDownloadedError, ValueError for an unknown model.
+      Blocking. Unloads any previous model first. Loads the model from models_dir()/<model>
+      without touching the network. Logs LOG_ENGINE_LOADED. Raises CudaUnavailableError
+      (cpu_mode False and the GPU backend is unusable), ModelNotDownloadedError, ValueError
+      for an unknown model or compute type. EngineInfo always states the device and compute
+      type actually in use, never the requested ones.
+      Windows: device="cuda" + compute_type, or, only if cpu_mode, device="cpu" +
+      CPU_COMPUTE_TYPE, because ctranslate2 picks its kernels at load time.
+      macOS: device="metal", or "cpu" if cpu_mode, and compute_type is the ggml quantization
+      of the file on disk ("f16" / "q5_0"). whisper.cpp has no runtime compute type, so
+      cpu_mode loads the same file and reports the same quantization; CPU_COMPUTE_TYPE does
+      not apply there.
     warmup(): one transcribe of 1 s of low-level noise with the configured params; result discarded.
     process(segment, task, decode, filt):
       Raises EngineNotLoadedError or TaskNotSupportedError. Fully consumes the segments generator.

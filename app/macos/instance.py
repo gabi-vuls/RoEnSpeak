@@ -8,7 +8,8 @@ window". macOS has neither, so:
   kernel drops the lock when the process dies, so a crash cannot leave a stale lock behind
   (a stale *file* is harmless; the lock, not its content, is what counts). Our pid is written
   into the file for diagnostics.
-* The sibling Unix socket ``<lock stem>.sock`` is the broadcast message. The first instance
+* A Unix socket is the broadcast message: the lock file's sibling ``<lock stem>.sock``, or a
+  short path under the temp dir when that would exceed ``sun_path``. The first instance
   listens on it on a daemon thread; a second launch connects, sends
   ``contracts.SHOW_WINDOW_MESSAGE_NAME`` and exits.
 
@@ -28,9 +29,11 @@ rule) and simply reports "we are the only instance".
 from __future__ import annotations
 
 import errno
+import hashlib
 import logging
 import os
 import socket
+import tempfile
 import threading
 from pathlib import Path
 from typing import Callable, Optional
@@ -56,6 +59,30 @@ def _default_on_show_window() -> None:
     log.info("show-window request ignored: no handler is wired yet")
 
 
+#: ``sockaddr_un.sun_path`` is 104 bytes on macOS, NUL terminator included, so a bind of a
+#: longer path fails with ENAMETOOLONG. The sibling-of-the-lock-file path is comfortably
+#: inside that for the real data dir (~62 bytes), but not for an isolated one: macOS's own
+#: $TMPDIR is already ~48 bytes before the file name, so any test or portable install that
+#: redirects ROENSPEAK_DATA_DIR would silently lose the "show window" ping -- the lock still
+#: works, so a second launch exits quietly without raising the running instance's window.
+SUN_PATH_MAX = 103
+
+
+def _socket_path_for(lock_path: Path) -> Path:
+    """The listener socket for this lock file: its sibling when that fits in sun_path, else a
+    short deterministic path under the temp dir. Both the holder and the notifier derive it
+    the same way from the same lock path, so they always agree on where to meet."""
+    sibling = lock_path.with_suffix(".sock")
+    if len(str(sibling).encode("utf-8")) <= SUN_PATH_MAX:
+        return sibling
+    digest = hashlib.sha1(str(lock_path).encode("utf-8")).hexdigest()[:12]
+    short = Path(tempfile.gettempdir()) / f"roenspeak-{digest}.sock"
+    if len(str(short).encode("utf-8")) > SUN_PATH_MAX:
+        short = Path("/tmp") / f"roenspeak-{digest}.sock"  # last resort: the shortest path there is
+    log.debug("socket path %s is too long for sun_path; using %s", sibling, short)
+    return short
+
+
 class FileLockSingleInstance:
     """See ``contracts.SingleInstance`` and this module's docstring.
 
@@ -72,7 +99,7 @@ class FileLockSingleInstance:
             self._lock_path = single_instance_lock_path()
         else:
             self._lock_path = data_dir() / (name.replace("\\", ".") + ".lock")
-        self._socket_path = self._lock_path.with_suffix(".sock")
+        self._socket_path = _socket_path_for(self._lock_path)
         self._lock = threading.Lock()
         self._fd: Optional[int] = None
         self._server: Optional[socket.socket] = None
