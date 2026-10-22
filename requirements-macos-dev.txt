@@ -1,0 +1,7 @@
+# Build + test extras for macOS, on top of the runtime lock.
+-r requirements-macos.txt
+pytest==9.1.1
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.9
+# No pefile: it parses Windows PE binaries and PyInstaller only imports it on win32. On macOS the
+# equivalent role is played by macholib, which is a hard dependency of pyinstaller (see the lock).

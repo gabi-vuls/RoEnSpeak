@@ -66,8 +66,10 @@ def os_display_name() -> str:
 #: The definitive check is CudaProbe actually loading cuBLAS/cuDNN.
 MIN_DRIVER_VERSION = "528.33"
 
-#: Minimum macOS version. Metal 3 + the Carbon hotkey and CGEvent APIs the macOS layer uses.
-MIN_MACOS_VERSION = "13.0"
+#: Minimum macOS version. Metal 3 and the Carbon hotkey / CGEvent APIs the macOS layer uses
+#: would run on 13.0, but the pinned wheels (PySide6-Essentials 6.12, onnxruntime 1.31,
+#: numpy 2.5.4) are all tagged macosx_14_0, so 14.0 is the real floor for a built .app.
+MIN_MACOS_VERSION = "14.0"
 
 #: Registered window message (RegisterWindowMessageW) a second instance broadcasts
 #: to ask the running instance to show its main window.
