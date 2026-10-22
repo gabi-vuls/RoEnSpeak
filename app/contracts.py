@@ -924,6 +924,10 @@ class Hotkey:
       Esc (alias Escape), Backspace, Insert (Ins), Delete (Del), Home, End, PageUp (PgUp),
       PageDown (PgDn), Up, Down, Left, Right, Pause, Numpad0-Numpad9,
       OEM punctuation by character: ; = , - . / ` [ \\ ] '
+    Not every key name exists on both platforms: Mac keyboards have no Insert, Pause or
+    F21-F24, so the macOS parser rejects those with a message naming the key. A Windows
+    config.json using one of them therefore falls back to DEFAULT_HOTKEY on a Mac, the same
+    way any other unusable hotkey does.
     Modifier aliases: Ctrl (Control, Ctl), Alt, Shift, Win (Windows, Meta, Super).
     On macOS: Alt (Option, Opt) and Cmd (Command, Win, Windows, Meta, Super); the macOS
     key table maps the same canonical key names onto Carbon kVK_* codes.
@@ -1107,7 +1111,12 @@ class ClipboardBackend(Protocol):
     set_text(text): empty + set CF_UNICODETEXT (13) as UTF-16-LE with NUL terminator, plus the
       registered formats "ExcludeClipboardContentFromMonitorProcessing" and
       "CanIncludeInClipboardHistory" (DWORD 0) so dictated text stays out of Win+V history/cloud sync.
-    restore(snap): empty + set every saved format back (an empty snapshot leaves the clipboard empty)."""
+    restore(snap): empty + set every saved format back (an empty snapshot leaves the clipboard empty).
+    The retry, the CF_UNICODETEXT encoding and the two history-exclusion formats are Win32
+    specifics. On macOS NSPasteboard needs none of them: format ids are UTI strings, the text
+    type is public.utf8-plain-text, and there is no OS clipboard history to opt out of, so
+    MacClipboard implements the same three methods with the same save/set/restore semantics
+    and skips the rest."""
 
     def save(self) -> ClipboardSnapshot: ...
     def set_text(self, text: str) -> None: ...
@@ -1118,8 +1127,15 @@ class ClipboardBackend(Protocol):
 class InjectionOutcome:
     injected_text: str  # exactly what was typed/pasted, including any leading space
     mode: InjectionMode
+    #: How many OS input events the injector sent. The unit is platform-specific and is only
+    #: meant for logging: Windows sends a down/up pair per UTF-16 code unit, while macOS packs
+    #: up to 20 code units into each CGEvent (surrogate pairs never split across two), so the
+    #: same text yields far fewer events there. Clipboard mode counts the paste chord.
     events_sent: int
-    t_injected: float  # perf_counter, when SendInput/paste returned
+    #: perf_counter, when SendInput / the paste chord returned. In clipboard mode this is
+    #: sampled before the paste-settle wait and the clipboard restore, so it measures when the
+    #: keystrokes reached the OS, not when the clipboard was put back.
+    t_injected: float
 
 
 #: Modifier VKs the injector waits on: L/R Ctrl, L/R Shift, L/R Alt, L/R Win.
