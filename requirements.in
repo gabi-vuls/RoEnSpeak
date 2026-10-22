@@ -1,0 +1,13 @@
+# Top-level runtime deps. requirements.txt is the pinned lock (Windows x64, CPython 3.12).
+# faster-whisper comes from the local SYSTRAN clone:
+#   WSL path:     /home/gabiv/dev/repos/faster-whisper
+#   Windows copy: C:\dev\faster-whisper  (rsync of the WSL clone, incl. .git)
+#   commit:       9e472ae9de8bb374552f531f752654554b76b2d6  (v1.2.1)
+faster-whisper @ git+file:///C:/dev/faster-whisper@9e472ae9de8bb374552f531f752654554b76b2d6
+ctranslate2>=4.5,<5          # CUDA 12 + cuDNN 9 builds
+nvidia-cublas-cu12           # cublas64_12.dll / cublasLt64_12.dll, bundled in the installer
+nvidia-cudnn-cu12==9.*       # cudnn*64_9.dll, bundled in the installer
+PySide6-Essentials
+sounddevice
+soxr
+nvidia-ml-py

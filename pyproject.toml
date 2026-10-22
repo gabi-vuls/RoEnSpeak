@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "roenspeak"
+version = "0.1.0"
+description = "Speak Romanian, type English: system-wide dictation with faster-whisper on CUDA"
+requires-python = ">=3.11"
+dependencies = [
+    "faster-whisper",
+    "ctranslate2>=4.5,<5",
+    "nvidia-cublas-cu12",
+    "nvidia-cudnn-cu12==9.*",
+    "PySide6-Essentials>=6.8",
+    "sounddevice>=0.5",
+    "soxr>=0.5",
+    "nvidia-ml-py>=12",
+]
+
+[project.scripts]
+roenspeak-cli = "app.cli:main"
+
+[project.gui-scripts]
+roenspeak = "app.main:main"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -m \"not gpu and not mic and not desktop\""
+markers = [
+    "gpu: needs an NVIDIA GPU with CUDA + a downloaded model (run with -m gpu)",
+    "mic: needs a real microphone and a human speaking (run with -m mic)",
+    "desktop: needs an interactive Windows desktop session; injects real keystrokes (run with -m desktop)",
+]
