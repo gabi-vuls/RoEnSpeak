@@ -895,10 +895,12 @@ class Modifier(str, enum.Enum):
     """Hotkey modifiers. CTRL/ALT/SHIFT exist on both platforms; WIN and CMD are the
     platform-specific "super" key.
 
-    The Windows parser accepts Ctrl/Alt/Shift/Win and never produces CMD. The macOS parser
-    accepts the same names plus Cmd/Command/Option/Opt, maps Win|Windows|Meta|Super|Cmd ->
-    CMD and Alt|Option|Opt -> ALT, and never produces WIN. So "Alt+Q" is a valid hotkey on
-    both (Alt+Q / Option+Q) and one config.json works on both platforms.
+    Both parsers accept both platforms' names for those two keys and canonicalise them to
+    the host's: Win|Windows|Meta|Super|Cmd|Command is WIN on Windows and CMD on macOS, and
+    Alt|Option|Opt is always ALT. Neither parser ever produces the other platform's member.
+    So a hotkey written on either platform loads on the other ("Cmd+F12" reads as "Win+F12"
+    on Windows, "Win+F12" as "Cmd+F12" on macOS), and the shared default "Alt+Q" means
+    Alt+Q on Windows and Option+Q on macOS. One config.json works on both platforms.
     """
 
     CTRL = "Ctrl"
@@ -928,9 +930,10 @@ class Hotkey:
     F21-F24, so the macOS parser rejects those with a message naming the key. A Windows
     config.json using one of them therefore falls back to DEFAULT_HOTKEY on a Mac, the same
     way any other unusable hotkey does.
-    Modifier aliases: Ctrl (Control, Ctl), Alt, Shift, Win (Windows, Meta, Super).
-    On macOS: Alt (Option, Opt) and Cmd (Command, Win, Windows, Meta, Super); the macOS
-    key table maps the same canonical key names onto Carbon kVK_* codes.
+    Modifier aliases, accepted on both platforms: Ctrl (Control, Ctl), Shift,
+    Alt (Option, Opt), and the super key as Win (Windows, Meta, Super, Cmd, Command) --
+    canonicalised to Win on Windows and Cmd on macOS. The macOS key table maps the same
+    canonical key names onto Carbon kVK_* codes.
     Separators: "+" with optional surrounding whitespace. "Ctrl++" is not supported;
     use "=" or "-" style keys only.
     """
@@ -960,6 +963,7 @@ class Hotkey:
         return value
 
 
+@runtime_checkable
 class HotkeyParser(Protocol):
     """parse(text) -> Hotkey or raises HotkeyParseError. Rejects: empty string, unknown
     token, duplicate modifier, modifier-only combos, more than one non-modifier key, no

@@ -2,6 +2,19 @@
 
 Derived from SPEC.md (defaults) and contracts.Config / ConfigStore docstrings plus the
 schema-0 comment. Every test runs with ROENSPEAK_CONFIG_DIR pointed at a temp dir (conftest).
+
+One config.json has to stay valid on both platforms (contracts.Modifier, contracts.ComputeType),
+so the few expectations that differ per host are derived from the contract here instead of
+being hard-coded to Windows:
+
+* the hotkey is validated through app.core.platform.parse_hotkey, i.e. with the *host's* key
+  table. Both parsers accept Ctrl/Alt/Shift and the same key names, so "Alt+Q" or
+  "Ctrl+Alt+F9" canonicalise identically everywhere. Only the "super" modifier differs:
+  the Windows parser produces Modifier.WIN ("Win"), the macOS one maps Win/Windows/Meta/
+  Super/Cmd/Command onto Modifier.CMD ("Cmd") -- see CANONICAL_SUPER_HOTKEY.
+* InjectionMode.SENDINPUT keeps its "sendinput" value on macOS (it selects
+  CGEventKeyboardSetUnicodeString there), and ComputeType keeps "float16"/"int8_float16"
+  (macOS picks a ggml file from them), so DEFAULT_DICT is the same JSON on both hosts.
 """
 
 from __future__ import annotations
@@ -32,6 +45,12 @@ from app.contracts import (
 from app.core.config import JsonConfigStore, config_from_dict, config_to_dict, migrate
 
 BAD_NAME_RE = re.compile(r"^config\.json\.bad-\d{8}-\d{6}")
+
+#: A hotkey on the OS "super" key, as the Windows build writes it into config.json.
+WINDOWS_SUPER_HOTKEY = "Win+F12"
+#: What that same file reads back as on this host: "Win+F12" on Windows, "Cmd+F12" on macOS
+#: (Modifier.CMD), and unchanged on a host with no platform layer (no parser -> no rewrite).
+CANONICAL_SUPER_HOTKEY = "Cmd+F12" if contracts.IS_MACOS else "Win+F12"
 
 DEFAULT_DICT = {
     "armed": True,
@@ -201,9 +220,11 @@ def test_save_overwrites_atomically_without_leftovers(tmp_path):
     store = JsonConfigStore(path)
     store.save(Config())
     store.save(CUSTOM)
-    store.save(dataclasses.replace(CUSTOM, hotkey="Win+F12"))
+    store.save(dataclasses.replace(CUSTOM, hotkey=WINDOWS_SUPER_HOTKEY))
     _assert_no_tmp_files(tmp_path)
-    assert store.load().hotkey == "Win+F12"
+    assert json.loads(path.read_text(encoding="utf-8"))["hotkey"] == WINDOWS_SUPER_HOTKEY
+    # load() re-canonicalises with the host's key table; the modifier is the only difference.
+    assert store.load().hotkey == CANONICAL_SUPER_HOTKEY
     assert list(store.last_warnings) == []
 
 
@@ -433,6 +454,88 @@ def test_hotkey_normalized(given, canonical):
     cfg, warnings = config_from_dict({**DEFAULT_DICT, "hotkey": given})
     assert cfg.hotkey == canonical
     assert list(warnings) == []
+
+
+# ---------------------------------------------------------------------------
+# One config.json on two platforms (contracts.Modifier / ComputeType)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("given", ["Win+F12", "win+f12", " Windows + F12 ", "meta+f12", "super+f12"])
+def test_super_modifier_aliases_normalize_to_the_host_super_key(given):
+    """Win/Windows/Meta/Super are accepted by both parsers; only the canonical name differs."""
+    cfg, warnings = config_from_dict({**DEFAULT_DICT, "hotkey": given})
+    assert list(warnings) == [], "a config written on the other platform must not be rejected"
+    assert cfg.hotkey == CANONICAL_SUPER_HOTKEY
+    if contracts.IS_MACOS:
+        assert cfg.hotkey == "Cmd+F12"
+    elif contracts.IS_WINDOWS:
+        assert cfg.hotkey == "Win+F12"
+
+
+def test_windows_config_file_loads_on_this_host(tmp_path):
+    """A config.json produced by the Windows build opens here with no warnings."""
+    path = tmp_path / "config.json"
+    windows_file = {**DEFAULT_DICT, "hotkey": WINDOWS_SUPER_HOTKEY, "injection_mode": "sendinput",
+                    "compute_type": "float16", "ui": {**DEFAULT_DICT["ui"], "start_with_windows": True}}
+    path.write_text(json.dumps(windows_file), encoding="utf-8")
+    store = JsonConfigStore(path)
+    cfg = store.load()
+    assert list(store.last_warnings) == []
+    assert cfg.hotkey == CANONICAL_SUPER_HOTKEY
+    assert cfg.injection_mode == InjectionMode.SENDINPUT  # same value on macOS (CGEvent)
+    assert cfg.compute_type == ComputeType.FLOAT16  # macOS: selects the ggml f16 file
+    assert cfg.ui.start_with_windows is True  # field name kept; only the UI label changes
+    assert cfg == dataclasses.replace(Config(), hotkey=CANONICAL_SUPER_HOTKEY,
+                                      ui=UiConfig(start_with_windows=True))
+
+
+def test_macos_cmd_hotkey_on_this_host():
+    """The reverse direction. Modifier.CMD exists only on macOS: the Windows parser accepts
+    no "Cmd" alias, so a Cmd hotkey written on a Mac falls back to the default there."""
+    cfg, warnings = config_from_dict({**DEFAULT_DICT, "hotkey": "Cmd+F12"})
+    if contracts.IS_MACOS:
+        assert cfg.hotkey == "Cmd+F12"
+        assert list(warnings) == []
+    elif contracts.IS_WINDOWS:
+        assert cfg.hotkey == Config().hotkey == "Alt+Q"
+        assert len(warnings) == 1
+
+
+@pytest.mark.skipif(not contracts.IS_MACOS, reason="Option/Opt are macOS modifier aliases")
+@pytest.mark.parametrize("given", ["alt+q", "option+q", "opt+q", "Option + Q"])
+def test_macos_option_aliases_canonicalize_to_the_shared_alt(given):
+    """Option+Q is written back as "Alt+Q", so the file stays readable on Windows too."""
+    cfg, warnings = config_from_dict({**DEFAULT_DICT, "hotkey": given})
+    assert cfg.hotkey == "Alt+Q" == contracts.DEFAULT_HOTKEY
+    assert list(warnings) == []
+
+
+def test_default_hotkey_is_valid_on_this_host():
+    cfg, warnings = config_from_dict({**DEFAULT_DICT, "hotkey": contracts.DEFAULT_HOTKEY})
+    assert cfg.hotkey == contracts.DEFAULT_HOTKEY
+    assert list(warnings) == []
+
+
+@pytest.mark.parametrize("ct", list(ComputeType), ids=[c.value for c in ComputeType])
+def test_compute_type_round_trips(tmp_path, ct):
+    """The enum values stay the ctranslate2 names on both platforms (macOS maps them onto
+    ggml files instead), so neither value is rewritten or rejected."""
+    cfg = dataclasses.replace(Config(), compute_type=ct)
+    raw = config_to_dict(cfg)
+    assert raw["compute_type"] == ct.value
+    back, warnings = config_from_dict(raw)
+    assert back.compute_type is ct
+    assert back == cfg
+    assert list(warnings) == []
+
+    path = tmp_path / "config.json"
+    store = JsonConfigStore(path)
+    store.save(cfg)
+    assert json.loads(path.read_text(encoding="utf-8"))["compute_type"] == ct.value
+    reloaded = JsonConfigStore(path)
+    assert reloaded.load().compute_type is ct
+    assert list(reloaded.last_warnings) == []
 
 
 def test_invalid_field_in_file_is_not_backed_up(tmp_path):

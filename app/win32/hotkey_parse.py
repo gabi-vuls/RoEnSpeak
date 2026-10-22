@@ -10,9 +10,14 @@ __all__ = ["parse_hotkey", "format_hotkey", "HotkeyStringParser", "KEYS", "PRINT
 
 _MODIFIER_ALIASES: dict[str, Modifier] = {
     "ctrl": Modifier.CTRL, "control": Modifier.CTRL, "ctl": Modifier.CTRL,
-    "alt": Modifier.ALT,
+    "alt": Modifier.ALT, "option": Modifier.ALT, "opt": Modifier.ALT,
     "shift": Modifier.SHIFT,
     "win": Modifier.WIN, "windows": Modifier.WIN, "meta": Modifier.WIN, "super": Modifier.WIN,
+    # The macOS names for the same two keys, so a config.json written on a Mac loads here
+    # instead of falling back to the default. The macOS parser mirrors this, mapping
+    # win|windows|meta|super to Modifier.CMD. Display stays canonical per MODIFIER_ORDER,
+    # so "Cmd+F12" read on Windows is rewritten as "Win+F12".
+    "cmd": Modifier.WIN, "command": Modifier.WIN,
 }
 
 
