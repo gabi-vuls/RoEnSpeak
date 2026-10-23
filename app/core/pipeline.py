@@ -177,6 +177,9 @@ class Pipeline:
       on_session_flushed(session_id)      injection thread, after the last segment of a
                                           flushed session was handled (also when it had none)
       on_segment_done(event, result, reason)  injection thread, after each segment
+
+    io_lock, when given, is held around each inject() so typing never interleaves with prompt
+    adjustment's copy/paste (both drive the clipboard and synthetic keystrokes).
     """
 
     def __init__(
@@ -197,6 +200,7 @@ class Pipeline:
         on_session_flushed: Callable[[int], None] = _noop,
         on_segment_done: Callable[[SegmentProcessed, TranslationResult, SegmentCloseReason], None] = _noop,
         clock: Callable[[], float] = time.perf_counter,
+        io_lock: Optional[threading.Lock] = None,
     ) -> None:
         self._segmenter = segmenter
         self._engine = engine
@@ -212,6 +216,7 @@ class Pipeline:
         self._on_session_flushed = on_session_flushed
         self._on_segment_done = on_segment_done
         self._clock = clock
+        self._io_lock = io_lock if io_lock is not None else threading.Lock()
 
         self._epoch = 0
         self._epoch_lock = threading.Lock()
@@ -515,7 +520,8 @@ class Pipeline:
             latency_ms = (r.t_infer_end - r.t_vad_close) * 1000.0
         elif not r.filtered and r.text.strip():
             try:
-                outcome = self._injector.inject(r.text, r.session_id)
+                with self._io_lock:
+                    outcome = self._injector.inject(r.text, r.session_id)
             except InjectionBlockedError as e:
                 log.warning("injection blocked (%s) for segment %d", e.reason, r.segment_id)
                 self._notify(_BLOCKED_TITLES.get(e.reason, _BLOCKED_TITLE_DEFAULT),

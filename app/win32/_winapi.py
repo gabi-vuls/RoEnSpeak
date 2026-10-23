@@ -183,6 +183,7 @@ class _Lib:
         bind(k32, "GlobalLock", ctypes.c_void_p, W.HGLOBAL)
         bind(k32, "GlobalUnlock", W.BOOL, W.HGLOBAL)
         bind(k32, "GlobalSize", ctypes.c_size_t, W.HGLOBAL)
+        bind(u32, "GetClipboardSequenceNumber", W.DWORD)
         # single instance / misc
         bind(k32, "CreateMutexW", W.HANDLE, ctypes.c_void_p, W.BOOL, W.LPCWSTR)
         bind(u32, "RegisterWindowMessageW", W.UINT, W.LPCWSTR)
@@ -366,6 +367,9 @@ class RealWinApi:
             return ctypes.string_at(ptr, size)
         finally:
             lib.GlobalUnlock(handle)
+
+    def get_clipboard_sequence_number(self) -> int:
+        return int(self._lib.GetClipboardSequenceNumber())
 
     def set_clipboard_bytes(self, fmt: int, data: bytes) -> bool:
         if not is_hglobal_clipboard_format(fmt):

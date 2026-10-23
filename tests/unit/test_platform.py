@@ -246,6 +246,7 @@ UNSUPPORTED_CALLS = {
     "make_api": lambda: platform_mod.make_api(),
     "make_clipboard": lambda: platform_mod.make_clipboard(None),
     "make_injector": lambda: platform_mod.make_injector(None, None, InjectionMode.SENDINPUT),
+    "make_selection_grabber": lambda: platform_mod.make_selection_grabber(None, None),
     "make_autostart": lambda: platform_mod.make_autostart(),
     "make_hotkey_factory": lambda: platform_mod.make_hotkey_factory(None),
     "make_single_instance": lambda: platform_mod.make_single_instance(None),

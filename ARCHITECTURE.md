@@ -21,6 +21,7 @@ covers the Windows specifics referenced above; section 12 covers macOS.
 | `app/engine/` | IMPL-ENGINE | CUDA/DLL probe, `WhisperEngine`, `ThresholdHallucinationFilter`, `HfModelDownloader`, VRAM check |
 | `app/win32/` | IMPL-WIN32 | `RealWinApi` (ctypes), hotkey parser, `Win32HotkeyManager`, `Win32TextInjector`, clipboard, single instance, autostart |
 | `app/macos/` | IMPL-MACOS | `RealMacApi` (ctypes), hotkey parser, `MacHotkeyManager` (Carbon), `MacTextInjector` (CGEvent), NSPasteboard clipboard, flock single instance, LaunchAgent autostart, permissions |
+| `app/llm/` | IMPL-CORE | Prompt adjustment: `OllamaClient` (stdlib urllib), the system prompt, output cleanup and the fidelity check |
 | `app/core/platform.py` | IMPL-CORE | The only platform dispatch: hotkey parsing plus a factory per platform object |
 | `app/ui/` | IMPL-UI | PySide6 main window, tray, REC overlay, sounds, download dialog, error dialogs, `QtUiFacade` |
 | `app/core/` + `app/main.py` + `app/cli.py` | IMPL-CORE | Config store and migration, logging, state machine, event bus, pipeline threads, `AppController`, entry points |
@@ -74,6 +75,21 @@ inside each function, so neither package is imported on the wrong platform.
   2. Second press → `MicSource.stop()` (blocks until no more callbacks) → `Flush` → state PROCESSING.
   3. When the inference queue drains past the flushed segment's id → READY.
   4. Disarm → stop the source, `Reset` (buffered audio is discarded), drain the queues, unregister the hotkey.
+- **Prompt adjustment (Windows).** A second `HotkeyManager` (own hotkey thread, default Alt+P) is registered
+  whenever `Config.llm.enabled`, independent of arming and of the Whisper model. Its `on_fire` calls
+  `PromptAdjuster.trigger()`, which only enqueues onto the `prompt-adjust` thread (one job at a time; a press
+  while busy, or while LISTENING/PROCESSING, is refused with a notification). A job:
+  1. under `io_lock`: wait for modifiers → UIPI check → save clipboard → empty → Ctrl+C → wait for
+     `GetClipboardSequenceNumber` to change (≤ 0.8 s) → read `CF_UNICODETEXT` → restore the clipboard;
+  2. no lock: `POST /api/chat` to Ollama (non-streaming, temperature 0, `num_ctx` from fixed buckets) →
+     `clean_output` → `check_fidelity`;
+  3. under `io_lock`: if the check passed (or `strict_check` is off), dictation did not start and the same
+     window still has the focus → `paste_raw` (clipboard + Ctrl+V, newlines kept as CRLF); otherwise the
+     rewrite goes to the clipboard and a notification says why;
+  4. append original + result to `prompt_history.jsonl`. Progress is published as `PromptStatus` events.
+
+  `io_lock` is also held by the injection thread around every `inject()`, so dictation typing and prompt
+  copy/paste never interleave on the clipboard or the keyboard. It is not part of the state machine.
 
 ## 3. Latency budget (target ≤ 1.5 s from end of speech to text)
 
@@ -155,7 +171,9 @@ the tray icon (disarmed/ready/listening/processing/error).
    UIPI blocking, so this check is the primary detection.)
 4. Default: one `SendInput` with `KEYEVENTF_UNICODE` down/up pairs per UTF-16 code unit, so diacritics and
    surrogate pairs work in any app. Clipboard mode instead does save formats → set text → Ctrl+V → wait 150 ms → restore.
-5. **Alt-menu suppression** happens in the hotkey manager, not the injector. When the hotkey fires with Alt down, it sends `VK 0xE8`
+5. **Raw paste** (`paste_raw`, prompt adjustment only): steps 2–3, then the clipboard path regardless of the
+   typing method, with the text unchanged except `\n` → `\r\n` (no step 1, no spacing).
+6. **Alt-menu suppression** happens in the hotkey manager, not the injector. When the hotkey fires with Alt down, it sends `VK 0xE8`
    down/up, so the focused app sees a non-Alt keystroke and does not open its menu bar when Alt is released.
 
 ## 8. Libraries
@@ -179,6 +197,12 @@ the tray icon (disarmed/ready/listening/processing/error).
   fall back to defaults with warnings, and a corrupt file is backed up as `config.json.bad-<ts>`.
 - Models: `%LOCALAPPDATA%\RoEnSpeak\models\<model>\` (plain files plus the `.download_complete` marker).
 - Logs: `%LOCALAPPDATA%\RoEnSpeak\logs\roenspeak.log` (rotating, 5 × 2 MB). The UI has an "Open log folder" button.
+  User text is never written there (only counts and timings).
+- Prompt history: `logs\prompt_history.jsonl` next to it, one JSON object per prompt adjustment with the original
+  and rewritten text (plain text, 5 MB × 4 files). Config keys: `prompt_hotkey` (default `Alt+P`, never equal to
+  `hotkey`; an equal value falls back to `Alt+P` / `Alt+Shift+P`) and the `llm` section (`enabled`, `ollama_url`,
+  `model`, `keep_alive`, `timeout_s`, `max_input_chars`, `strict_check`). Older config files without them load
+  with the defaults, so the schema version is unchanged.
 - Tests redirect all three locations with `ROENSPEAK_CONFIG_DIR` / `ROENSPEAK_DATA_DIR` / `ROENSPEAK_MODELS_DIR`.
 - Single instance: the named mutex `Local\RoEnSpeak.SingleInstance`. A second launch broadcasts the registered message
   `RoEnSpeak.ShowWindow` and exits.

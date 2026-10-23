@@ -9,6 +9,10 @@ Threading model
   * Pipeline/download/hotkey callbacks never block: they post a job to core-control. The one
     exception is the idle-unload check, which runs synchronously on the inference thread.
   * Nothing that holds self._lock ever waits for a pipeline thread, so there is no lock cycle.
+  * Prompt adjustment (Windows) has its own hotkey manager and its own "prompt-adjust" worker
+    (app.core.prompt_adjust); it is registered whenever Config.llm.enabled, independent of
+    arming and of the Whisper model. self._io_lock keeps its copy/paste and dictation typing
+    from interleaving.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from typing import Any, Callable, Optional
 
 from app.contracts import (
     DEFAULT_HOTKEY,
+    DEFAULT_PROMPT_HOTKEY,
     MODELS,
     AppError,
     AppEvent,
@@ -56,6 +61,7 @@ from app.contracts import (
     InvalidTransition,
     ModelDownloader,
     Notification,
+    PromptHotkeyChanged,
     Segmenter,
     SegmentProcessed,
     SingleInstance,
@@ -70,6 +76,7 @@ from app.core import platform
 from app.core.config import JsonConfigStore, config_from_dict, config_to_dict
 from app.core.events import SimpleEventBus
 from app.core.pipeline import Pipeline
+from app.core.prompt_adjust import PromptAdjuster
 from app.core.state import AppStateMachine
 
 log = logging.getLogger("roenspeak.core.controller")
@@ -152,6 +159,12 @@ class AppController:
         self._hotkey_mgr: Optional[HotkeyManager] = None
         self._hotkey_registered = False  # armed: hotkey owned by us (may be suspended)
         self._hotkey_suspended = False  # temporarily unregistered while the UI captures a combo
+        self._clipboard: Any = None
+        self._io_lock = threading.Lock()  # dictation injection vs prompt adjustment copy/paste
+        self._prompt: Optional[PromptAdjuster] = None
+        self._prompt_mgr: Optional[HotkeyManager] = None
+        self._prompt_registered = False  # prompt hotkey owned by us (may be suspended)
+        self._prompt_suspended = False
 
         self._engine_info: Optional[EngineInfo] = None
         self._loaded_key: Optional[ModelKey] = None
@@ -232,6 +245,7 @@ class AppController:
     def set_hotkey(self, text: str) -> Hotkey:
         hk = platform.parse_hotkey(text)  # HotkeyParseError propagates
         with self._lock:
+            self._check_not_other_hotkey(hk, self._config.prompt_hotkey, "prompt adjustment")
             self._register_checked(hk)  # HotkeyConflictError propagates; previous stays
             new = dataclasses.replace(self._config, hotkey=hk.display)
             self._store.save(new)
@@ -245,6 +259,64 @@ class AppController:
     def reset_hotkey(self) -> Hotkey:
         return self.set_hotkey(DEFAULT_HOTKEY)
 
+    def set_prompt_hotkey(self, text: str) -> Hotkey:
+        hk = platform.parse_hotkey(text)  # HotkeyParseError propagates
+        with self._lock:
+            self._check_not_other_hotkey(hk, self._config.hotkey, "dictation")
+            self._register_prompt_checked(hk)  # HotkeyConflictError propagates; previous stays
+            new = dataclasses.replace(self._config, prompt_hotkey=hk.display)
+            self._store.save(new)
+            self._config = new
+            registered = self._prompt_registered
+        log.info("prompt hotkey set to %s (registered=%s)", hk.display, registered)
+        self._publish(ConfigChanged(new))
+        self._publish(PromptHotkeyChanged(hk.display if registered else None, registered))
+        return hk
+
+    def reset_prompt_hotkey(self) -> Hotkey:
+        return self.set_prompt_hotkey(DEFAULT_PROMPT_HOTKEY)
+
+    def test_llm_connection(self, callback: Callable[[bool, str], None]) -> None:
+        adjuster = self._prompt
+
+        def run() -> None:
+            if adjuster is None:
+                ok, message = False, "Prompt adjustment is not available on this system."
+            else:
+                try:
+                    res = adjuster.check_connection()
+                    ok, message = res.ok, res.message
+                except Exception as e:  # health() never raises; belt and braces
+                    log.exception("LLM connection test failed")
+                    ok, message = False, f"Connection test failed: {e}"
+            log.info("LLM connection test: ok=%s %s", ok, message)
+            try:
+                callback(ok, message)
+            except Exception:
+                log.exception("LLM connection test callback failed")
+
+        threading.Thread(target=run, name="core-llm-test", daemon=True).start()
+
+    @staticmethod
+    def _check_not_other_hotkey(hk: Hotkey, other: str, other_name: str) -> None:
+        try:
+            other_hk = platform.parse_hotkey(other)
+        except (HotkeyParseError, ImportError):
+            return
+        if hk.display.casefold() == other_hk.display.casefold():
+            raise HotkeyConflictError(
+                hk.display, details=f"same as the {other_name} hotkey",
+                message=f"{hk.display} is already the {other_name} hotkey. Choose a different combination.",
+            )
+
+    def _register_prompt_checked(self, hk: Hotkey) -> None:
+        """Caller holds self._lock. Like _register_checked, for the prompt hotkey."""
+        if not self._prompt_registered or self._prompt_mgr is None:
+            return
+        self._prompt_mgr.register(hk)
+        if self._prompt_suspended:
+            self._prompt_mgr.unregister()
+
     def _register_checked(self, hk: Hotkey) -> None:
         """Caller holds self._lock. When armed, registers hk (raises on conflict, previous stays);
         while suspended, the registration is only a conflict check and is removed again."""
@@ -256,6 +328,7 @@ class AppController:
 
     def suspend_hotkey(self, suspended: bool) -> None:
         with self._lock:
+            self._suspend_prompt_hotkey(suspended)
             mgr = self._hotkey_mgr
             if suspended:
                 if self._hotkey_registered and not self._hotkey_suspended and mgr is not None:
@@ -283,6 +356,62 @@ class AppController:
                 self._publish(HotkeyChanged(None, False))
                 self._goto(AppState.DISARMED)
 
+    def _suspend_prompt_hotkey(self, suspended: bool) -> None:
+        """Caller holds self._lock. The capture field must be able to record either combo."""
+        mgr = self._prompt_mgr
+        if mgr is None or suspended == self._prompt_suspended:
+            return
+        self._prompt_suspended = suspended
+        if not self._prompt_registered or self._quitting:
+            return
+        if suspended:
+            try:
+                mgr.unregister()
+            except Exception:
+                log.exception("prompt hotkey unregister (suspend) failed")
+            return
+        try:
+            mgr.register(platform.parse_hotkey(self._config.prompt_hotkey))
+        except (HotkeyConflictError, HotkeyParseError) as e:
+            log.warning("could not re-register prompt hotkey %s: %s", self._config.prompt_hotkey,
+                        e.details or e.user_message)
+            self._prompt_registered = False
+            self._publish(ErrorRaised(type(e).__name__, e.user_message, details=e.details, fatal=False))
+            self._publish(PromptHotkeyChanged(None, False))
+
+    def _sync_prompt_hotkey(self) -> None:
+        """Registers the prompt hotkey iff llm.enabled (unregisters otherwise). Conflicts are
+        reported and leave it unregistered; dictation is not affected."""
+        with self._lock:
+            mgr = self._prompt_mgr
+            if mgr is None:
+                return
+            if not self._config.llm.enabled or self._quitting:
+                if self._prompt_registered:
+                    try:
+                        mgr.unregister()
+                    except Exception:
+                        log.exception("prompt hotkey unregister failed")
+                    self._prompt_registered = False
+                    log.info("prompt hotkey unregistered")
+                    self._publish(PromptHotkeyChanged(None, False))
+                return
+            try:
+                hk = platform.parse_hotkey(self._config.prompt_hotkey)
+                if not self._prompt_suspended:
+                    mgr.register(hk)
+            except (HotkeyConflictError, HotkeyParseError) as e:
+                log.warning("could not register prompt hotkey %s: %s", self._config.prompt_hotkey,
+                            e.details or e.user_message)
+                self._prompt_registered = False
+                self._publish(ErrorRaised(type(e).__name__, f"Prompt adjustment hotkey: {e.user_message}",
+                                          details=e.details, fatal=False))
+                self._publish(PromptHotkeyChanged(None, False))
+                return
+            self._prompt_registered = True
+            log.info("prompt hotkey %s registered", hk.display)
+            self._publish(PromptHotkeyChanged(hk.display, True))
+
     def update_config(self, cfg: Config) -> None:
         if not isinstance(cfg, Config):
             raise ConfigError("Invalid settings object.")
@@ -294,6 +423,9 @@ class AppController:
             hotkey_changed = validated.hotkey != old.hotkey
             if hotkey_changed:
                 self._register_checked(platform.parse_hotkey(validated.hotkey))  # HotkeyConflictError propagates
+            prompt_hotkey_changed = validated.prompt_hotkey != old.prompt_hotkey
+            if prompt_hotkey_changed:
+                self._register_prompt_checked(platform.parse_hotkey(validated.prompt_hotkey))
             # Arming is applied asynchronously by _arm/_disarm, which persist it themselves.
             new = dataclasses.replace(validated, armed=old.armed)
             self._store.save(new)
@@ -304,6 +436,11 @@ class AppController:
         self._publish(ConfigChanged(new))
         if hotkey_changed:
             self._publish(HotkeyChanged(new.hotkey if registered else None, registered))
+        if new.llm.enabled != old.llm.enabled:
+            self._sync_prompt_hotkey()
+        elif prompt_hotkey_changed:
+            self._publish(PromptHotkeyChanged(new.prompt_hotkey if self._prompt_registered else None,
+                                              self._prompt_registered))
         want_armed = validated.armed
         self._post(lambda: self._apply_config_async(old, new, want_armed))
 
@@ -402,6 +539,7 @@ class AppController:
             return
         if self._quitting:
             return
+        self._sync_prompt_hotkey()  # works whatever happens to the GPU / model below
 
         cfg = self._config
         if not cfg.cpu_mode:
@@ -452,15 +590,15 @@ class AppController:
         if (self._injector is None or self._hotkey_factory is None) and self._api is None:
             self._api = platform.make_api()
         if self._injector is None:
-            self._injector = platform.make_injector(
-                self._api, platform.make_clipboard(self._api), cfg.injection_mode
-            )
+            self._clipboard = platform.make_clipboard(self._api)
+            self._injector = platform.make_injector(self._api, self._clipboard, cfg.injection_mode)
         if self._autostart is None:
             self._autostart = platform.make_autostart()
         if self._hotkey_factory is None:
             self._hotkey_factory = platform.make_hotkey_factory(self._api)
         self._hotkey_mgr = self._hotkey_factory(self._on_hotkey_fire)
         self._hotkey_mgr.start()
+        self._build_prompt_adjuster()
 
         self._pipeline = Pipeline(
             segmenter=self._segmenter,
@@ -477,8 +615,35 @@ class AppController:
             idle_unload_check=self._idle_unload_check,
             on_session_flushed=lambda sid: self._post(lambda: self._on_session_flushed(sid)),
             on_segment_done=self._on_segment_done,
+            io_lock=self._io_lock,
         )
         self._pipeline.start()
+
+    def _build_prompt_adjuster(self) -> None:
+        """Prompt adjustment needs the platform's selection grabber and a raw paste; it is
+        skipped (no prompt hotkey) on hosts without them or with injected test doubles."""
+        if not platform.SUPPORTS_PROMPT_ADJUST or self._api is None or not hasattr(self._injector, "paste_raw"):
+            log.info("prompt adjustment not available here")
+            return
+        try:
+            if self._clipboard is None:
+                self._clipboard = platform.make_clipboard(self._api)
+            grabber = platform.make_selection_grabber(self._api, self._clipboard)
+        except Exception:
+            log.exception("prompt adjustment unavailable")
+            return
+        self._prompt = PromptAdjuster(
+            grabber=grabber,
+            paste=self._injector.paste_raw,
+            set_clipboard=self._clipboard.set_text,
+            get_config=lambda: self._config.llm,
+            is_dictating=lambda: self._sm.state in (AppState.LISTENING, AppState.PROCESSING),
+            bus=self._bus,
+            io_lock=self._io_lock,
+        )
+        self._prompt.start()
+        self._prompt_mgr = self._hotkey_factory(self._on_prompt_hotkey_fire)
+        self._prompt_mgr.start()
 
     def _vram_check(self, gpu: Any, cfg: Config) -> None:
         try:
@@ -818,6 +983,11 @@ class AppController:
         # Hotkey thread: never block.
         self._post(self._toggle)
 
+    def _on_prompt_hotkey_fire(self) -> None:
+        # Hotkey thread: never block (trigger only enqueues).
+        if self._prompt is not None and not self._quitting:
+            self._prompt.trigger()
+
     def _toggle(self) -> None:
         with self._lock:
             if self._pipeline is None or not self._hotkey_registered:
@@ -1061,6 +1231,14 @@ class AppController:
                 except Exception:
                     log.exception("hotkey manager stop failed")
                 self._hotkey_registered = False
+            if self._prompt_mgr is not None:
+                try:
+                    self._prompt_mgr.stop()
+                except Exception:
+                    log.exception("prompt hotkey manager stop failed")
+                self._prompt_registered = False
+            if self._prompt is not None:
+                self._prompt.stop(timeout=1.0)
             if self._pipeline is not None:
                 # An in-progress load can't be interrupted: wait for it (bounded) so the model is
                 # unloaded cleanly on the inference thread instead of being cut off at exit.

@@ -1,4 +1,7 @@
-"""Settings tabs (General / Model / Advanced) with an explicit Apply button.
+"""Settings tabs (General / Model / Prompt / Advanced) with an explicit Apply button.
+
+The Prompt tab (prompt adjustment through a local Ollama model) exists only where
+app.core.platform.SUPPORTS_PROMPT_ADJUST (Windows); elsewhere Config.llm is kept as loaded.
 
 Labels and hints are platform-aware (autostart wording, the paste shortcut, "VRAM" vs
 "unified memory", NVIDIA vs Metal, and the download size of the CTranslate2 model directory
@@ -25,6 +28,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
@@ -46,6 +50,8 @@ from app.contracts import (
     InjectionMode,
     Task,
 )
+from app.core.platform import SUPPORTS_PROMPT_ADJUST
+from app.core.prompt_history import HISTORY_FILE_NAME
 
 log = logging.getLogger("roenspeak.ui.settings")
 
@@ -141,6 +147,7 @@ class SettingsPanel(QWidget):
     """Owns the settings widgets and the Apply/Revert flow."""
 
     applied = Signal(object)  # the Config passed to update_config successfully
+    _llm_test_done = Signal(bool, str)  # emitted from a core thread; queued onto the Qt thread
 
     def __init__(self, controller: Controller, parent=None) -> None:
         super().__init__(parent)
@@ -152,7 +159,11 @@ class SettingsPanel(QWidget):
         self.tabs.setDocumentMode(True)
         self.tabs.addTab(self._build_general(), "General")
         self.tabs.addTab(self._build_model(), "Model")
+        self._has_prompt = SUPPORTS_PROMPT_ADJUST
+        if self._has_prompt:
+            self.tabs.addTab(self._build_prompt(), "Prompt")
         self.tabs.addTab(self._build_advanced(), "Advanced")
+        self._llm_test_done.connect(self._on_llm_test_done)
 
         self.message = QLabel("")
         self.message.setWordWrap(True)
@@ -280,6 +291,86 @@ class SettingsPanel(QWidget):
         form.addRow(self.cpu_warning)  # spans both columns so it wraps at full width
         return w
 
+    def _build_prompt(self) -> QWidget:
+        w = QWidget()
+        form = QFormLayout(w)
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        self.llm_enabled_check = QCheckBox("Prompt adjustment hotkey")
+        self.llm_enabled_check.setToolTip("Select text in any app and press the prompt hotkey: the selection is "
+                                          "replaced by the same prompt, restructured by the local model.")
+        form.addRow("", self.llm_enabled_check)
+
+        self.llm_url_edit = QLineEdit()
+        self.llm_url_edit.setPlaceholderText("http://localhost:11434")
+        form.addRow("Ollama URL", self.llm_url_edit)
+        self.llm_model_edit = QLineEdit()
+        self.llm_model_edit.setPlaceholderText("qwen2.5-coder:14b")
+        self.llm_model_edit.setToolTip("Any model installed in Ollama (ollama list).")
+        form.addRow("Model", self.llm_model_edit)
+
+        self.llm_keep_alive_edit = QLineEdit()
+        self.llm_keep_alive_edit.setToolTip(
+            "How long Ollama keeps the model in memory after a request: e.g. 10m, 30s, 1h; "
+            "0 = unload right away (frees GPU memory, slower next time); -1 = keep loaded."
+        )
+        form.addRow("Keep model loaded", self.llm_keep_alive_edit)
+
+        self.llm_timeout_spin = QSpinBox()
+        self.llm_timeout_spin.setRange(5, 600)
+        self.llm_timeout_spin.setSuffix(" s")
+        self.llm_timeout_spin.setToolTip("Includes loading the model the first time (can take a while).")
+        form.addRow("Timeout", self.llm_timeout_spin)
+
+        self.llm_max_chars_spin = QSpinBox()
+        self.llm_max_chars_spin.setRange(100, 200_000)
+        self.llm_max_chars_spin.setSingleStep(1000)
+        self.llm_max_chars_spin.setSuffix(" chars")
+        form.addRow("Max selection", self.llm_max_chars_spin)
+
+        self.llm_strict_check = QCheckBox("Keep my text if the rewrite may have lost information")
+        self.llm_strict_check.setToolTip(
+            "Each rewrite is checked: numbers, names, paths, URLs and code must survive and nothing new may "
+            "be added. When the check fails, your text stays as it was and the rewrite goes to the clipboard."
+        )
+        form.addRow("", self.llm_strict_check)
+
+        self.llm_test_btn = QPushButton("Test connection")
+        self.llm_test_btn.setToolTip("Checks that Ollama runs and the model is installed (applied settings).")
+        self.llm_test_btn.clicked.connect(self._test_llm)
+        self.llm_test_result = _hint()
+        test_row = QHBoxLayout()
+        test_row.setContentsMargins(0, 0, 0, 0)
+        test_row.addWidget(self.llm_test_btn)
+        test_row.addWidget(self.llm_test_result, 1)
+        form.addRow("", test_row)
+        form.addRow(_hint(f"Original and rewritten text of every run are kept in {HISTORY_FILE_NAME} "
+                          "in the log folder."))
+
+        for cb in (self.llm_enabled_check, self.llm_strict_check):
+            cb.toggled.connect(self._changed)
+        for edit in (self.llm_url_edit, self.llm_model_edit, self.llm_keep_alive_edit):
+            edit.textChanged.connect(self._changed)
+        for spin in (self.llm_timeout_spin, self.llm_max_chars_spin):
+            spin.valueChanged.connect(self._changed)
+        return w
+
+    def _test_llm(self) -> None:
+        if self.dirty:
+            self._show_llm_test("Apply your changes first; the test uses the applied settings.", WARN_COLOR)
+            return
+        self.llm_test_btn.setEnabled(False)
+        self._show_llm_test("Checking…", None)
+        self._controller.test_llm_connection(lambda ok, msg: self._llm_test_done.emit(ok, msg))
+
+    def _on_llm_test_done(self, ok: bool, message: str) -> None:
+        self.llm_test_btn.setEnabled(True)
+        self._show_llm_test(message, OK_COLOR if ok else ERROR_COLOR)
+
+    def _show_llm_test(self, text: str, color: Optional[str]) -> None:
+        self.llm_test_result.setText(text)
+        self.llm_test_result.setStyleSheet(f"font-size: 8.5pt; color: {color or HINT_COLOR};")
+
     def _build_advanced(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -394,12 +485,32 @@ class SettingsPanel(QWidget):
             self.maxseg_spin.setValue(cfg.vad.max_segment_s)
             self.threshold_spin.setValue(cfg.vad.threshold)
             self.blocklist_edit.setPlainText("\n".join(cfg.filter.blocklist))
+            if self._has_prompt:
+                self.llm_enabled_check.setChecked(cfg.llm.enabled)
+                self.llm_url_edit.setText(cfg.llm.ollama_url)
+                self.llm_model_edit.setText(cfg.llm.model)
+                self.llm_keep_alive_edit.setText(cfg.llm.keep_alive)
+                self.llm_timeout_spin.setValue(cfg.llm.timeout_s)
+                self.llm_max_chars_spin.setValue(cfg.llm.max_input_chars)
+                self.llm_strict_check.setChecked(cfg.llm.strict_check)
         finally:
             self._loading = False
         self._changed()
 
     def build_config(self, base: Config) -> Config:
         """The Config the widgets describe, layered onto base (armed/hotkey/etc. untouched)."""
+        llm = base.llm
+        if self._has_prompt:
+            llm = dataclasses.replace(
+                base.llm,
+                enabled=self.llm_enabled_check.isChecked(),
+                ollama_url=self.llm_url_edit.text().strip().rstrip("/"),
+                model=self.llm_model_edit.text().strip(),
+                keep_alive=self.llm_keep_alive_edit.text().strip(),
+                timeout_s=self.llm_timeout_spin.value(),
+                max_input_chars=self.llm_max_chars_spin.value(),
+                strict_check=self.llm_strict_check.isChecked(),
+            )
         return dataclasses.replace(
             base,
             mic_device=self.mic_combo.currentData(),
@@ -423,6 +534,7 @@ class SettingsPanel(QWidget):
                 sounds=self.sounds_check.isChecked(),
                 start_with_windows=self.autostart_check.isChecked(),
             ),
+            llm=llm,
         )
 
     @property

@@ -1,4 +1,4 @@
-"""Main window: ON/OFF switch, hotkey capture, status line, settings."""
+"""Main window: ON/OFF switch, hotkey capture (dictation + prompt adjustment), status line, settings."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from app.contracts import (
     APP_NAME,
     APP_VERSION,
     DEFAULT_HOTKEY,
+    DEFAULT_PROMPT_HOTKEY,
     IS_MACOS,
     AppError,
     AppState,
@@ -30,6 +31,7 @@ from app.contracts import (
     HotkeyConflictError,
     HotkeyParseError,
 )
+from app.core.platform import SUPPORTS_PROMPT_ADJUST
 from app.ui.assets import app_icon
 from app.ui.hotkey_capture import HotkeyCaptureEdit
 from app.ui.settings_panel import ERROR_COLOR, HINT_COLOR, OK_COLOR, SettingsPanel
@@ -37,6 +39,13 @@ from app.ui.status import SOFT_ERROR_COLOR, STATE_COLORS, engine_text, latency_t
 from app.ui.widgets import StatusDot, ToggleSwitch
 
 log = logging.getLogger("roenspeak.ui.window")
+
+#: PromptStatus.phase -> what the prompt hint shows while a job runs.
+PROMPT_PHASE_TEXT = {
+    "copying": "Copying the selection…",
+    "rewriting": "Rewriting the prompt with the local model…",
+    "pasting": "Pasting the rewritten prompt…",
+}
 
 #: How the user's OS names the modifiers a hotkey may use (contracts.Modifier).
 MODIFIER_HINT = "Cmd, Ctrl or Option" if IS_MACOS else "Ctrl, Alt or Win"
@@ -62,6 +71,8 @@ class MainWindow(QWidget):
         self._detail = ""
         self._download_pct: Optional[float] = None
         self._hard_error = False
+        self._prompt_registered: Optional[bool] = None  # None until the first PromptHotkeyChanged
+        self._prompt_phase: Optional[str] = None  # set while a prompt adjustment runs
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(app_icon())
         self.setMinimumWidth(480)
@@ -135,10 +146,45 @@ class MainWindow(QWidget):
         self.hotkey_message.hide()
         grid.addWidget(self.hotkey_message, 2, 1, 1, 2)
 
+        # Prompt adjustment hotkey (Windows): select text, press it, the selection is rewritten.
+        prompt_label = QLabel("Prompt hotkey")
+        prompt_label.setToolTip("Select text in any app and press this combination: the selection is "
+                                "rewritten as a clear, structured prompt by the local model (Ollama).")
+        self.prompt_hotkey_edit = HotkeyCaptureEdit()
+        self.prompt_hotkey_edit.setMinimumWidth(170)
+        self.prompt_hotkey_edit.captured.connect(self._on_prompt_hotkey_captured)
+        self.prompt_hotkey_edit.capture_cancelled.connect(lambda: self._set_prompt_message("", None))
+        self.prompt_hotkey_edit.capture_state_changed.connect(self._on_prompt_capture_state)
+        self.prompt_hotkey_edit.unsupported_key.connect(
+            lambda k: self._set_prompt_message(
+                f"“{k}” can't be used. Try a letter, digit or F-key with {MODIFIER_LIST}.", ERROR_COLOR
+            )
+        )
+        self.reset_prompt_hotkey_btn = QPushButton("Reset to default")
+        self.reset_prompt_hotkey_btn.setToolTip(f"Use {DEFAULT_PROMPT_HOTKEY}")
+        self.reset_prompt_hotkey_btn.clicked.connect(self._on_reset_prompt_hotkey)
+        self.prompt_hint = QLabel("")
+        self.prompt_hint.setWordWrap(True)
+        self.prompt_hint.setStyleSheet(f"color: {HINT_COLOR};")
+        self.prompt_message = QLabel("")
+        self.prompt_message.setWordWrap(True)
+        self.prompt_message.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.prompt_message.hide()
+        grid.addWidget(prompt_label, 3, 0)
+        grid.addWidget(self.prompt_hotkey_edit, 3, 1)
+        grid.addWidget(self.reset_prompt_hotkey_btn, 3, 2)
+        grid.addWidget(self.prompt_hint, 4, 1, 1, 2)
+        grid.addWidget(self.prompt_message, 5, 1, 1, 2)
+        self._prompt_widgets = (prompt_label, self.prompt_hotkey_edit, self.reset_prompt_hotkey_btn,
+                                self.prompt_hint)
+        if not SUPPORTS_PROMPT_ADJUST:
+            for w in self._prompt_widgets:
+                w.hide()
+
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
         line.setFrameShadow(QFrame.Sunken)
-        grid.addWidget(line, 3, 0, 1, 3)
+        grid.addWidget(line, 6, 0, 1, 3)
 
         self.status_dot = StatusDot()
         self.status_label = QLabel("")
@@ -150,7 +196,7 @@ class MainWindow(QWidget):
         status_row = QHBoxLayout()
         status_row.addWidget(self.status_dot, 0, Qt.AlignVCenter)
         status_row.addWidget(self.status_label, 1)
-        grid.addLayout(status_row, 4, 0, 1, 3)
+        grid.addLayout(status_row, 7, 0, 1, 3)
         self.engine_label = QLabel("")
         self.engine_label.setStyleSheet(f"color: {HINT_COLOR};")
         self.latency_label = QLabel("")
@@ -159,7 +205,7 @@ class MainWindow(QWidget):
         info_row.setContentsMargins(22, 0, 0, 0)
         info_row.addWidget(self.engine_label, 1)
         info_row.addWidget(self.latency_label, 0, Qt.AlignRight)
-        grid.addLayout(info_row, 5, 0, 1, 3)
+        grid.addLayout(info_row, 8, 0, 1, 3)
         grid.setColumnStretch(1, 1)
 
         # Settings
@@ -178,6 +224,9 @@ class MainWindow(QWidget):
         self._hotkey_msg_timer = QTimer(self)
         self._hotkey_msg_timer.setSingleShot(True)
         self._hotkey_msg_timer.timeout.connect(lambda: self._set_hotkey_message("", None))
+        self._prompt_msg_timer = QTimer(self)
+        self._prompt_msg_timer.setSingleShot(True)
+        self._prompt_msg_timer.timeout.connect(lambda: self._set_prompt_message("", None))
 
         self.sync_from_controller()
         self.set_engine_info(controller.engine_info)
@@ -194,7 +243,30 @@ class MainWindow(QWidget):
         )
         if not self.hotkey_edit.capturing:
             self.hotkey_edit.set_display(cfg.hotkey)
+        if not self.prompt_hotkey_edit.capturing:
+            self.prompt_hotkey_edit.set_display(cfg.prompt_hotkey)
+        self._render_prompt_hint()
         self._render_status()
+
+    def set_prompt_hotkey_state(self, registered: bool) -> None:
+        self._prompt_registered = registered
+        self._render_prompt_hint()
+
+    def set_prompt_status(self, busy: bool, phase: str) -> None:
+        self._prompt_phase = phase if busy else None
+        self._render_prompt_hint()
+
+    def _render_prompt_hint(self) -> None:
+        cfg = self._controller.config
+        if self._prompt_phase is not None:
+            text = PROMPT_PHASE_TEXT.get(self._prompt_phase, "Adjusting the prompt…")
+        elif not cfg.llm.enabled:
+            text = "Off - turn on prompt adjustment in Settings."
+        elif self._prompt_registered is False:
+            text = "The prompt hotkey is not registered. Choose another combination."
+        else:
+            text = f"Select text in any app, press {cfg.prompt_hotkey}: it is rewritten as a structured prompt."
+        self.prompt_hint.setText(text)
 
     def set_state(self, state: AppState, detail: str = "") -> None:
         self._state = state
@@ -274,6 +346,41 @@ class MainWindow(QWidget):
             self._set_hotkey_message(f"Hotkey set to {hk.display}{suffix}.", OK_COLOR)
         self.sync_from_controller()
 
+    def _on_prompt_capture_state(self, active: bool) -> None:
+        try:
+            self._controller.suspend_hotkey(active)  # suspends both hotkeys
+        except Exception:  # noqa: BLE001 (capture must keep working; core logs the cause)
+            log.exception("suspend_hotkey(%s) failed", active)
+        if active:
+            self._set_prompt_message(f"Press the new combination (with {MODIFIER_HINT}). Esc cancels.", None)
+
+    def _apply_prompt_hotkey(self, action) -> None:
+        try:
+            hk = action()
+        except AppError as exc:  # HotkeyParseError / HotkeyConflictError / ConfigError
+            log.info("prompt hotkey rejected: %s", exc.user_message)
+            self._set_prompt_message(exc.user_message, ERROR_COLOR, sticky=True)
+        else:
+            self.prompt_hotkey_edit.set_display(hk.display)
+            suffix = "" if self._controller.config.llm.enabled else " (applies when prompt adjustment is on)"
+            self._set_prompt_message(f"Prompt hotkey set to {hk.display}{suffix}.", OK_COLOR)
+        self.sync_from_controller()
+
+    def _on_prompt_hotkey_captured(self, text: str) -> None:
+        self._apply_prompt_hotkey(lambda: self._controller.set_prompt_hotkey(text))
+
+    def _on_reset_prompt_hotkey(self) -> None:
+        self.prompt_hotkey_edit.cancel_capture()
+        self._apply_prompt_hotkey(self._controller.reset_prompt_hotkey)
+
+    def _set_prompt_message(self, text: str, color: Optional[str], sticky: bool = False) -> None:
+        self._prompt_msg_timer.stop()
+        self.prompt_message.setText(text)
+        self.prompt_message.setStyleSheet(f"color: {color or HINT_COLOR};")
+        self.prompt_message.setVisible(bool(text))
+        if text and color == OK_COLOR and not sticky:
+            self._prompt_msg_timer.start(4000)
+
     def _on_hotkey_captured(self, text: str) -> None:
         self._apply_hotkey(lambda: self._controller.set_hotkey(text))
 
@@ -300,10 +407,12 @@ class MainWindow(QWidget):
 
     def hideEvent(self, event: QHideEvent) -> None:  # noqa: N802
         self.hotkey_edit.cancel_capture()  # also resumes the suspended hotkey
+        self.prompt_hotkey_edit.cancel_capture()
         super().hideEvent(event)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         self.hotkey_edit.cancel_capture()
+        self.prompt_hotkey_edit.cancel_capture()
         event.ignore()
         self.hide()
         self.hidden_to_tray.emit()
