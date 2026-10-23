@@ -28,6 +28,7 @@ from typing import Any, Callable, Optional
 from app.contracts import (
     IS_MACOS,
     IS_WINDOWS,
+    MIN_DRIVER_VERSION,
     MIN_MACOS_VERSION,
     AppError,
     Autostart,
@@ -269,9 +270,15 @@ def open_folder(path: Path) -> None:
 def gpu_requirement_message(reason: Optional[str] = None) -> str:
     """Explains what the GPU backend needs, around the probe's/engine's failure reason."""
     if IS_WINDOWS:
-        from app.engine.engine import cuda_requirement_message
-
-        return cuda_requirement_message(reason)
+        # The CUDA probe's wording, unchanged from the Windows-only controller; engine-raised
+        # CUDA errors keep their own text (app.engine.engine.cuda_requirement_message).
+        return (
+            f"RoEnSpeak needs an NVIDIA GPU with driver {MIN_DRIVER_VERSION} or newer, and the CUDA "
+            f"libraries (cuBLAS, cuDNN) must load.\n\n"
+            f"Problem: {reason or 'CUDA is not available.'}\n\n"
+            f"Install or update the NVIDIA driver, then restart RoEnSpeak. If this PC has no NVIDIA GPU, "
+            f"you can enable \"CPU mode (slow)\" in Settings."
+        )
     if IS_MACOS:
         msg = (
             f"RoEnSpeak needs macOS {MIN_MACOS_VERSION} or newer on an Apple silicon Mac (or another "

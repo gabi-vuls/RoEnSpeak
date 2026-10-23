@@ -491,15 +491,15 @@ def test_windows_config_file_loads_on_this_host(tmp_path):
 
 
 def test_macos_cmd_hotkey_on_this_host():
-    """The reverse direction. Modifier.CMD exists only on macOS: the Windows parser accepts
-    no "Cmd" alias, so a Cmd hotkey written on a Mac falls back to the default there."""
+    """The reverse direction: a Cmd hotkey written on a Mac loads on Windows as the Win key
+    (app.win32.hotkey_parse maps cmd|command to Modifier.WIN) and is displayed as "Win+F12"."""
     cfg, warnings = config_from_dict({**DEFAULT_DICT, "hotkey": "Cmd+F12"})
     if contracts.IS_MACOS:
         assert cfg.hotkey == "Cmd+F12"
         assert list(warnings) == []
     elif contracts.IS_WINDOWS:
-        assert cfg.hotkey == Config().hotkey == "Alt+Q"
-        assert len(warnings) == 1
+        assert cfg.hotkey == "Win+F12"
+        assert list(warnings) == []
 
 
 @pytest.mark.skipif(not contracts.IS_MACOS, reason="Option/Opt are macOS modifier aliases")

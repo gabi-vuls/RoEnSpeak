@@ -431,6 +431,7 @@ def test_parse_devices_tolerates_anything(text):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="sysctl is macOS-only")
 def test_sysctl_for_an_unknown_key_is_none():
     assert mp.sysctl_str("roenspeak.no.such.key") is None
     assert mp.sysctl_u64("roenspeak.no.such.key") is None
@@ -440,10 +441,12 @@ def test_macos_version_never_raises():
     assert isinstance(mp.macos_version(), str)
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="sysctl is macOS-only")
 def test_chip_name_always_returns_something():
     assert mp.chip_name()
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="sysctl is macOS-only")
 def test_unified_memory_is_never_negative():
     assert mp.unified_memory_mb() >= 0
 

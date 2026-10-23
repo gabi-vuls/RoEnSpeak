@@ -18,7 +18,6 @@ test_deep_data_dir_keeps_the_lock_but_loses_show_window.
 from __future__ import annotations
 
 import errno
-import fcntl
 import logging
 import os
 import shutil
@@ -29,6 +28,8 @@ import threading
 from pathlib import Path
 
 import pytest
+
+fcntl = pytest.importorskip("fcntl", reason="the macOS single-instance guard (POSIX flock)")
 
 from app import contracts
 from app.contracts import SHOW_WINDOW_MESSAGE_NAME, SingleInstance
