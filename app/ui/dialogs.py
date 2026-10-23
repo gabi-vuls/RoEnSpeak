@@ -1,9 +1,17 @@
-"""Non-modal error dialogs and the model download dialog."""
+"""Non-modal error dialogs and the model download dialog.
+
+Titles and help texts are platform-aware: the Windows build talks about the NVIDIA driver,
+VRAM and Windows privacy settings, the macOS build about Metal, unified memory, System
+Settings and - the macOS-only failure mode - the Accessibility permission without which
+every synthetic keystroke is silently dropped. Nothing else differs.
+"""
 
 from __future__ import annotations
 
 import logging
 import time
+from typing import Optional
+
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
@@ -18,7 +26,10 @@ from PySide6.QtWidgets import (
 
 from app.contracts import (
     APP_NAME,
+    GGML_REPO,
+    IS_MACOS,
     MIN_DRIVER_VERSION,
+    MIN_MACOS_VERSION,
     MODELS,
     AppError,
     Controller,
@@ -37,7 +48,7 @@ HINT_COLOR = "#7a7f87"
 
 #: Friendly dialog titles per ErrorRaised.kind (AppError subclass name).
 ERROR_TITLES: dict[str, str] = {
-    "CudaUnavailableError": "NVIDIA GPU required",
+    "CudaUnavailableError": "GPU required" if IS_MACOS else "NVIDIA GPU required",
     "GpuOutOfMemoryError": "Not enough GPU memory",
     "ModelNotDownloadedError": "Speech model missing",
     "DownloadError": "Model download failed",
@@ -51,25 +62,108 @@ ERROR_TITLES: dict[str, str] = {
 }
 
 #: Extra guidance shown under the message for some error kinds.
-ERROR_HELP: dict[str, str] = {
-    "CudaUnavailableError": (
-        "RoEnSpeak runs speech recognition on an NVIDIA graphics card and needs an NVIDIA GPU with "
-        f"driver {MIN_DRIVER_VERSION} or newer.\n\n"
-        "• Install or update the NVIDIA driver (nvidia.com/drivers), then restart RoEnSpeak.\n"
-        "• No NVIDIA GPU? Enable Settings → Model → “CPU mode (slow)”. It works, but each phrase takes several seconds."
-    ),
-    "GpuOutOfMemoryError": (
-        "The graphics card ran out of memory for the speech model.\n\n"
-        "• Close GPU-heavy apps (games, video editors, other AI tools) and try again.\n"
-        "• Or choose Settings → Model → Compute type “int8_float16”, or the smaller “medium” model."
-    ),
-    "AudioDeviceError": (
-        "Check that the microphone is plugged in and allowed in Windows Settings → Privacy → Microphone, "
-        "then choose it in Settings → General."
-    ),
-    "DownloadError": "Check your internet connection, then try again. Partially downloaded files are kept.",
-    "ModelNotDownloadedError": "Open RoEnSpeak and download the model when asked.",
-}
+if IS_MACOS:
+    ERROR_HELP: dict[str, str] = {
+        "CudaUnavailableError": (
+            "RoEnSpeak runs speech recognition on the Mac's GPU through Metal and needs macOS "
+            f"{MIN_MACOS_VERSION} or newer.\n\n"
+            "• Update macOS, then restart RoEnSpeak.\n"
+            "• Or enable Settings → Model → “CPU mode (slow)”. It works, but each phrase takes "
+            "several seconds."
+        ),
+        "GpuOutOfMemoryError": (
+            "The Mac ran out of memory for the speech model.\n\n"
+            "• Close memory-heavy apps and try again.\n"
+            "• Or choose Settings → Model → Compute type “int8_float16”, or the smaller “medium” model."
+        ),
+        "AudioDeviceError": (
+            "Check that the microphone is plugged in and allowed in System Settings → Privacy & "
+            "Security → Microphone, then choose it in Settings → General."
+        ),
+        "InjectionBlockedError": (
+            "macOS only lets an app type into other apps once you allow it under Accessibility, "
+            "and it silently drops the keystrokes until you do.\n\n"
+            "• Open System Settings → Privacy & Security → Accessibility and switch RoEnSpeak on.\n"
+            "• Already on after an update? Switch it off and on again.\n"
+            "• Password fields block synthetic keystrokes even with permission; dictate into a "
+            "normal text field."
+        ),
+        "DownloadError": "Check your internet connection, then try again. Partially downloaded files are kept.",
+        "ModelNotDownloadedError": "Open RoEnSpeak and download the model when asked.",
+    }
+else:
+    ERROR_HELP: dict[str, str] = {
+        "CudaUnavailableError": (
+            "RoEnSpeak runs speech recognition on an NVIDIA graphics card and needs an NVIDIA GPU with "
+            f"driver {MIN_DRIVER_VERSION} or newer.\n\n"
+            "• Install or update the NVIDIA driver (nvidia.com/drivers), then restart RoEnSpeak.\n"
+            "• No NVIDIA GPU? Enable Settings → Model → “CPU mode (slow)”. It works, but each phrase takes several seconds."
+        ),
+        "GpuOutOfMemoryError": (
+            "The graphics card ran out of memory for the speech model.\n\n"
+            "• Close GPU-heavy apps (games, video editors, other AI tools) and try again.\n"
+            "• Or choose Settings → Model → Compute type “int8_float16”, or the smaller “medium” model."
+        ),
+        "AudioDeviceError": (
+            "Check that the microphone is plugged in and allowed in Windows Settings → Privacy → Microphone, "
+            "then choose it in Settings → General."
+        ),
+        "DownloadError": "Check your internet connection, then try again. Partially downloaded files are kept.",
+        "ModelNotDownloadedError": "Open RoEnSpeak and download the model when asked.",
+    }
+
+#: Title and text of the first-run Accessibility prompt (macOS only). The wording of the
+#: failure itself lives in contracts.InjectionBlockedError.MESSAGES["no_accessibility"].
+ACCESSIBILITY_TITLE = "Allow RoEnSpeak to type"
+ACCESSIBILITY_BUTTON = "Open System Settings…"
+
+
+def mac_permissions():
+    """app.macos.permissions, or None when it is unavailable (non-macOS, or a build without
+    it). Imported lazily so the UI never hard-depends on the platform package."""
+    if not IS_MACOS:
+        return None
+    try:
+        from app.macos import permissions
+    except Exception:  # noqa: BLE001 (any import failure just means "no helper")
+        log.debug("app.macos.permissions unavailable", exc_info=True)
+        return None
+    return permissions
+
+
+def open_accessibility_settings() -> None:
+    """Ask macOS for Accessibility access and open the right System Settings pane.
+
+    request_accessibility() shows the system prompt (which has its own "Open System
+    Settings" button) the first time; open_privacy_settings() is what actually gets the user
+    to the switch on later attempts, so both are called.
+    """
+    permissions = mac_permissions()
+    if permissions is None:
+        log.warning("cannot open Accessibility settings: app.macos.permissions unavailable")
+        return
+    for name, args in (("request_accessibility", ()), ("open_privacy_settings", ("accessibility",))):
+        func = getattr(permissions, name, None)
+        if func is None:
+            log.warning("app.macos.permissions.%s is missing", name)
+            continue
+        try:
+            func(*args)
+        except Exception:  # noqa: BLE001 (a permission helper must never break the dialog)
+            log.exception("app.macos.permissions.%s failed", name)
+
+
+def accessibility_granted() -> Optional[bool]:
+    """True/False from app.macos.permissions, or None when it cannot be determined."""
+    permissions = mac_permissions()
+    func = getattr(permissions, "accessibility_granted", None) if permissions else None
+    if func is None:
+        return None
+    try:
+        return bool(func())
+    except Exception:  # noqa: BLE001
+        log.exception("accessibility_granted() failed")
+        return None
 
 
 def present(widget, activate: bool) -> None:
@@ -89,8 +183,16 @@ class ErrorDialogs:
         self._open: dict[tuple[str, str], QMessageBox] = {}
 
     def show(
-        self, title: str, message: str, details: str = "", kind: str = "", activate: bool = True
+        self,
+        title: str,
+        message: str,
+        details: str = "",
+        kind: str = "",
+        activate: bool = True,
+        accessibility_help: bool = False,
     ) -> QMessageBox:
+        """accessibility_help adds an "Open System Settings…" button (macOS only) that takes
+        the user straight to Privacy & Security → Accessibility."""
         title = title or ERROR_TITLES.get(kind, f"{APP_NAME} error")
         key = (title, message)
         box = self._open.get(key)
@@ -107,6 +209,14 @@ class ErrorDialogs:
             box.setInformativeText(help_text)
         if details:
             box.setDetailedText(details)
+        if accessibility_help and IS_MACOS:
+            btn = box.addButton(ACCESSIBILITY_BUTTON, QMessageBox.ActionRole)
+            btn.clicked.connect(open_accessibility_settings)
+            box.setDefaultButton(btn)
+            # With more than one button QMessageBox finds no escape button on its own, and
+            # then refuses every close() - which also vetoes QApplication.quit(), because Qt
+            # cancels a quit when a window will not close. Name it explicitly.
+            box.setEscapeButton(box.button(QMessageBox.Ok))
         box.finished.connect(lambda _r, k=key: self._open.pop(k, None))
         self._open[key] = box
         log.info("error dialog: %s | %s (activate=%s)", title, message, activate)
@@ -143,7 +253,8 @@ class DownloadDialog(QDialog):
 
         spec = MODELS.get(model)
         label = spec.label if spec else model
-        repo = spec.hf_repo if spec else model
+        # macOS downloads one ggml file from GGML_REPO; Windows a CTranslate2 model directory.
+        repo = (GGML_REPO if IS_MACOS else spec.hf_repo) if spec else model
         heading = QLabel(f"<b>Download the speech model “{label}”</b>")
         explain = QLabel(
             f"RoEnSpeak needs this model to understand speech. It is about {size_mb / 1000:.1f} GB and is "

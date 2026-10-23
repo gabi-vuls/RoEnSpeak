@@ -7,3 +7,13 @@ build/work/
 build/out/
 installer/Output/
 *.log
+
+# macOS build output.
+# NOTE: .gitignore has no inline comments -- a trailing "# ..." becomes part of the pattern.
+# build/native: the 7 whisper.cpp dylibs staged by native/whispercpp/build.sh
+build/native/
+# build/notarize: notarytool submission staging
+build/notarize/
+# disk images; the release one is dist/RoEnSpeak-<version>.dmg, covered by dist/ above
+*.dmg
+.DS_Store

@@ -211,13 +211,13 @@ def _v_blocklist(v: Any) -> tuple[str, ...]:
 def _v_hotkey(v: Any) -> str:
     if not isinstance(v, str) or not v.strip():
         raise _Invalid(f"expected a hotkey string, got {v!r}")
-    try:
-        from app.win32.hotkey_parse import parse_hotkey
-    except ImportError as e:  # win32 package unavailable (non-Windows tooling); keep as typed
-        log.debug("hotkey parser unavailable (%s); hotkey kept unvalidated", e)
-        return v.strip()
+    from app.core.platform import parse_hotkey
+
     try:
         return parse_hotkey(v).display
+    except ImportError as e:  # no platform layer for this host; keep the string as typed
+        log.debug("hotkey parser unavailable (%s); hotkey kept unvalidated", e)
+        return v.strip()
     except Exception as e:  # HotkeyParseError, or anything the parser chokes on
         raise _Invalid(f"invalid hotkey {v!r}: {getattr(e, 'user_message', e)}") from None
 

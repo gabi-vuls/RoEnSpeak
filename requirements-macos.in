@@ -1,0 +1,35 @@
+# Top-level runtime deps for macOS (Apple Silicon). requirements-macos.txt is the pinned lock
+# (macOS arm64, CPython 3.12). The Windows lock is requirements.in / requirements.txt; the two are
+# deliberately separate files because they share no engine.
+#
+# THE SPEECH ENGINE IS NOT A PYTHON PACKAGE ON macOS.
+# Windows installs faster-whisper from a local SYSTRAN clone. macOS instead builds whisper.cpp from
+# source and loads it through ctypes, so the engine is pinned by native/whispercpp/build.sh, not by
+# pip:
+#   repo:   https://github.com/ggml-org/whisper.cpp
+#   tag:    v1.9.5
+#   commit: d1be6fde11ac6e0407606b4e42fe72d34add8037   (tag object d2a764c648779feb36d44363f212a29b00aad1af)
+#   build:  cmake -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=ON
+#           plus app/engine/whispercpp.py's C shim -> libroenspeak_whisper.dylib
+#   ships:  7 dylibs, 7.8 MB total, staged into build/native (see BUILD.md "Bundle layout (macOS)")
+# Metal shaders are embedded in libggml-metal.dylib, so there is no .metallib to redistribute.
+#
+# WHY THERE IS NO faster-whisper / ctranslate2 / nvidia-* HERE
+#   * nvidia-cublas-cu12, nvidia-cudnn-cu12, nvidia-cuda-nvrtc-cu12, nvidia-ml-py: CUDA. There is no
+#     CUDA on Apple Silicon and these wheels have no macOS arm64 build at all.
+#   * ctranslate2: its macOS wheels are CPU-only (no Metal backend), which would make the app several
+#     times slower than whisper.cpp on the same machine - the whole point of the port is the Metal
+#     path. It also drags in its own OpenMP runtime.
+#   * faster-whisper: a thin layer over ctranslate2, so it inherits the above. Dropping it also drops
+#     `av` (PyAV/FFmpeg, ~40 MB) and `tokenizers` (a Rust extension), neither of which the macOS
+#     pipeline needs: audio comes from PortAudio via sounddevice and whisper.cpp tokenizes internally.
+#     The one thing faster-whisper used to supply that IS still needed is the Silero VAD model, now
+#     vendored at assets/vad/silero_vad_v6.onnx (see assets/vad/README.md).
+#   build_macos.sh fails the build if any of these are found in the venv.
+PySide6-Essentials         # universal2 wheels; thinned to arm64 by the spec's target_arch
+sounddevice                # PortAudio (_sounddevice_data/portaudio-binaries/libportaudio.dylib)
+soxr                       # resample the capture stream to the 16 kHz whisper.cpp requires
+onnxruntime                # Silero VAD, on the CPU
+numpy                      # audio buffers; also imported by app/contracts.py
+huggingface_hub            # ggml model downloads from ggerganov/whisper.cpp (resumable)
+tqdm                       # huggingface_hub's progress reporting

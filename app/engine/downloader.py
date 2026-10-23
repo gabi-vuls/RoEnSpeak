@@ -338,6 +338,11 @@ class HfModelDownloader:
         session = get_session()
 
         retries = 0
+        # Restarts are counted separately from retries, because `retries` is reset by every
+        # written chunk: a server that serves fewer bytes than the manifest promises and then
+        # answers 416 to the resume request would otherwise loop forever (full GET -> short
+        # write -> 416 -> discard -> full GET ...), never failing and never finishing.
+        restarts = 0
         while True:
             if cancel.is_set():
                 raise DownloadCancelledError("Download cancelled.")
@@ -357,6 +362,14 @@ class HfModelDownloader:
                         # Range not satisfiable: our .part is unusable; start over.
                         part.unlink(missing_ok=True)
                         progress.set_done(progress.done - have)
+                        restarts += 1
+                        if restarts > MAX_STREAM_RETRIES:
+                            raise DownloadError(
+                                f"Download of {f.name} failed: the server keeps refusing to "
+                                "resume it. Check your connection and try again.",
+                                details=(f"HTTP 416 after {restarts} restarts; "
+                                         f"expected {f.size} bytes, url={url}"),
+                            )
                         continue
                     if resp.status_code not in (200, 206):
                         resp.read()
@@ -369,6 +382,14 @@ class HfModelDownloader:
                         logger.info("server ignored Range for %s; restarting the file", f.name)
                         progress.set_done(progress.done - have)
                         mode = "wb"
+                        restarts += 1
+                        if restarts > MAX_STREAM_RETRIES:
+                            raise DownloadError(
+                                f"Download of {f.name} failed: the server keeps restarting it "
+                                "instead of resuming. Check your connection and try again.",
+                                details=(f"Range ignored after {restarts} restarts; "
+                                         f"expected {f.size} bytes, url={url}"),
+                            )
                     with open(part, mode) as out:
                         for chunk in resp.iter_bytes(CHUNK_SIZE):
                             if cancel.is_set():

@@ -21,6 +21,7 @@ from app.contracts import (
     APP_NAME,
     APP_VERSION,
     DEFAULT_HOTKEY,
+    IS_MACOS,
     AppError,
     AppState,
     Config,
@@ -36,6 +37,10 @@ from app.ui.status import SOFT_ERROR_COLOR, STATE_COLORS, engine_text, latency_t
 from app.ui.widgets import StatusDot, ToggleSwitch
 
 log = logging.getLogger("roenspeak.ui.window")
+
+#: How the user's OS names the modifiers a hotkey may use (contracts.Modifier).
+MODIFIER_HINT = "Cmd, Ctrl or Option" if IS_MACOS else "Ctrl, Alt or Win"
+MODIFIER_LIST = "Cmd/Ctrl/Option" if IS_MACOS else "Ctrl/Alt/Win"
 
 
 def _card() -> QFrame:
@@ -115,7 +120,9 @@ class MainWindow(QWidget):
         self.hotkey_edit.capture_cancelled.connect(lambda: self._set_hotkey_message("", None))
         self.hotkey_edit.capture_state_changed.connect(self._on_capture_state)
         self.hotkey_edit.unsupported_key.connect(
-            lambda k: self._set_hotkey_message(f"“{k}” can't be used. Try a letter, digit or F-key with Ctrl/Alt/Win.", ERROR_COLOR)
+            lambda k: self._set_hotkey_message(
+                f"“{k}” can't be used. Try a letter, digit or F-key with {MODIFIER_LIST}.", ERROR_COLOR
+            )
         )
         grid.addWidget(self.hotkey_edit, 1, 1)
         self.reset_hotkey_btn = QPushButton("Reset to default")
@@ -248,7 +255,9 @@ class MainWindow(QWidget):
         except Exception:  # noqa: BLE001 (capture must keep working; core logs the cause)
             log.exception("suspend_hotkey(%s) failed", active)
         if active:
-            self._set_hotkey_message("Press the new combination (with Ctrl, Alt or Win). Esc cancels.", None)
+            self._set_hotkey_message(
+                f"Press the new combination (with {MODIFIER_HINT}). Esc cancels.", None
+            )
 
     def _apply_hotkey(self, action) -> None:
         try:

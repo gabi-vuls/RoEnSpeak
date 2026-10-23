@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Entitlements for RoEnSpeak.app. build/build_macos.sh passes this file to codesign together
+      with the hardened runtime option, both for the default ad hoc signature and for a real
+      Developer ID.
+
+      Full rationale, including what is deliberately absent (app sandbox, allow jit, apple
+      events) and how the hardened runtime interacts with the Accessibility grant: BUILD.md,
+      section "Signing and notarization (macOS)".
+
+      Two entitlements, both load bearing:
+
+        com.apple.security.device.audio.input (spelled with a dash below)
+            Microphone access under the hardened runtime, declared at signing time so the
+            NSMicrophoneUsageDescription prompt from Info.plist is honoured.
+
+        com.apple.security.cs.disable.library.validation (spelled with dashes below)
+            Lets the process load the whisper.cpp and ggml dylibs, Qt plugins, onnxruntime and
+            PortAudio, none of which carry this app's Team ID; in an ad hoc build none carry a
+            Team ID at all. Without it the Metal engine fails to load.
+
+      Three rules for editing this file, none of which plutil lint catches but all of which
+      codesign does, because codesign parses it with AMFIUnserializeXML:
+        1. no comment before the root element,
+        2. no angle brackets inside a comment,
+        3. no doubled hyphen inside a comment (which is why the two keys are spelled with dots
+           in this comment and with hyphens in the actual keys).
+    -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>

@@ -46,7 +46,14 @@ from .helpers import (
     wav_duration_s,
 )
 
-pytestmark = pytest.mark.desktop
+pytestmark = [
+    pytest.mark.desktop,
+    # Windows-only harness (SendInput/HWND via ctypes.windll). tests/conftest.py gates by
+    # marker, and `desktop` now runs on whichever host selects it, so this file needs its
+    # own host guard -- otherwise `-m desktop` on a Mac would run it and die in windll.
+    # The macOS counterpart is test_desktop_injection_mac.py.
+    pytest.mark.skipif(sys.platform != "win32", reason="needs Windows (SendInput)"),
+]
 
 TEST_HOTKEY = "Ctrl+Alt+Shift+F10"
 VK_SHIFT, VK_CONTROL, VK_MENU, VK_F10 = 0x10, 0x11, 0x12, 0x79

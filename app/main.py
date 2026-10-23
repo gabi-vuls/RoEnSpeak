@@ -2,7 +2,7 @@
 
     python -m app.main [--minimized] [--debug-audio-wav PATH]
 
-Order: CUDA DLL paths -> logging -> single instance -> QApplication -> QtUiFacade ->
+Order: GPU library paths -> logging -> single instance -> QApplication -> QtUiFacade ->
 AppController -> run_ui. controller.shutdown() runs on every exit path (normal quit,
 exception, WM_ENDSESSION via commitDataRequest/aboutToQuit, atexit backstop).
 """
@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import sys
 
-# Must happen before anything imports ctranslate2 (it resolves cuBLAS/cuDNN at import/load time).
-from app.engine.cuda_probe import WindowsCudaProbe
+# The probe is created and setup_dll_paths() runs at import time, before anything imports the
+# engine: on Windows ctranslate2 resolves cuBLAS/cuDNN at import/load time, so the DLL
+# directories must already be on the search path. (No-op on macOS, where it returns [].)
+from app.core import platform
 
-_PROBE = WindowsCudaProbe()
+_PROBE = platform.make_probe()
 _PROBE.setup_dll_paths()
 
 import argparse  # noqa: E402
@@ -45,11 +47,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log.info("%s %s starting (python %s, frozen=%s), log=%s", APP_NAME, APP_VERSION, sys.version.split()[0],
              getattr(sys, "frozen", False), log_file)
 
-    from app.win32._winapi import RealWinApi
-    from app.win32.instance import NamedMutexSingleInstance
-
-    api = RealWinApi()
-    instance = NamedMutexSingleInstance(api)
+    api = platform.make_api()
+    instance = platform.make_single_instance(api)
     if not instance.acquire():
         log.info("another instance is running; asking it to show its window")
         instance.notify_existing()
@@ -75,6 +74,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         atexit.register(controller.shutdown, 10.0)
         # Logoff/shutdown (WM_QUERYENDSESSION/WM_ENDSESSION) -> commitDataRequest; then aboutToQuit.
+        # macOS never emits commitDataRequest, so the connection is simply never fired there.
         qapp.commitDataRequest.connect(lambda _mgr: controller.shutdown(8.0))
         qapp.aboutToQuit.connect(lambda: controller.shutdown(15.0))
         # Start once the event loop runs, i.e. after run_ui has built the window and subscribed

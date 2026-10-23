@@ -1,0 +1,51 @@
+# Pinned lock for macOS arm64 (Apple Silicon) / CPython 3.12. See requirements-macos.in for
+# provenance and for why faster-whisper, ctranslate2 and the nvidia-* wheels are absent.
+#
+# Generated from the working .venv with `pip freeze`, then reduced to the runtime closure
+# (pytest/pyinstaller/pip/setuptools/wheel and their own deps live in requirements-macos-dev.txt).
+# Verified 2026-10-22 on an Apple M1 Max, macOS 26.6.2, in a CPython 3.12.9 arm64 venv:
+# `pip check` clean, and the frozen RoEnSpeak-cli translates tests/fixtures/ro_sample.wav on Metal.
+#
+# ARM64-ONLY, and that is what fixes the build's target_arch. onnxruntime 1.31.0
+# (macosx_14_0_arm64), soxr 1.1.0 (macosx_11_0_arm64) and numpy 2.5.4 (macosx_14_0_arm64) publish
+# no x86_64 or universal2 macOS wheel for CPython 3.12, so a universal2 .app is not buildable from
+# these pins. PySide6-Essentials/shiboken6 are universal2 and get thinned to arm64 at build time.
+#
+# NOTE: the PySide6-Essentials, onnxruntime and numpy wheels are tagged macosx_14_0, i.e. they want
+# macOS 14 even though contracts.MIN_MACOS_VERSION (and therefore LSMinimumSystemVersion) says 13.0.
+# See BUILD.md "Prerequisites (macOS)".
+
+# --- UI -------------------------------------------------------------------------------------
+PySide6-Essentials==6.12.0
+shiboken6==6.12.0
+
+# --- audio capture and resampling -----------------------------------------------------------
+sounddevice==0.5.6
+cffi==2.1.1                 # sounddevice's PortAudio binding
+pycparser==3.12             # cffi
+soxr==1.1.0
+
+# --- voice activity detection (Silero, assets/vad/silero_vad_v6.onnx) -----------------------
+onnxruntime==1.31.0
+flatbuffers==25.12.19       # onnxruntime
+protobuf==7.36.2            # onnxruntime
+
+# --- numerics ---------------------------------------------------------------------------------
+numpy==2.5.4
+
+# --- ggml model downloads from ggerganov/whisper.cpp ----------------------------------------
+huggingface_hub==2.2.0
+hf-xet==1.7.0               # accelerated transfers; optional at runtime, bundled when present
+click==8.5.0                # huggingface_hub
+filelock==4.2.4             # huggingface_hub
+fsspec==2026.9.0            # huggingface_hub
+PyYAML==6.0.3               # huggingface_hub
+packaging==26.3             # huggingface_hub, onnxruntime
+typing_extensions==4.16.0   # huggingface_hub, anyio, httpx2
+httpx2==2.16.0              # huggingface_hub's HTTP client
+httpcore2==2.16.0           # httpx2
+h11==0.16.0                 # httpcore2
+anyio==4.15.1               # httpx2
+idna==3.20                  # anyio, httpx2
+truststore==0.10.5          # httpx2/httpcore2: use the macOS system trust store for TLS
+tqdm==4.70.1                # download progress

@@ -46,6 +46,28 @@ def tray_icon(state: str) -> QIcon:
 
 
 @lru_cache(maxsize=None)
+def tray_template_icon(state: str) -> QIcon:
+    """Template (mask) status-item icon for macOS: a monochrome silhouette that the system
+    paints black on a light menu bar and white on a dark one.
+
+    The 16/32/64 px files are the 1x/2x/4x renderings; Qt picks by device pixel ratio.
+    setIsMask(True) is what makes Qt hand NSImage a template image.
+    """
+    from app.ui.icon_art import TRAY_TEMPLATE_SIZES, render_tray_template
+
+    icon = QIcon()
+    for size in TRAY_TEMPLATE_SIZES:
+        p = asset_path("icons", f"tray_{state}_template_{size}.png")
+        if p.is_file():
+            icon.addFile(str(p))
+        else:
+            log.warning("missing icon %s; rendering at runtime", p)
+            icon.addPixmap(QPixmap.fromImage(render_tray_template(state, size)))
+    icon.setIsMask(True)
+    return icon
+
+
+@lru_cache(maxsize=None)
 def app_icon() -> QIcon:
     from app.ui.icon_art import ICO_SIZES, render_app_icon
 

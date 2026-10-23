@@ -2,12 +2,20 @@
 
 Host API choice: Windows WASAPI (shared mode) when present, because it reports full device
 names (MME truncates them to 31 characters) and follows the Windows default recording
-device. The stream is first opened at 16 kHz mono with WASAPI auto_convert (the Windows
+device. On macOS the equivalent is Core Audio, which is the only host API PortAudio builds
+there and is listed right after WASAPI so the first-match scan is deterministic on both
+platforms (no host API named "Core Audio" exists on Windows, so Windows behaviour is
+unchanged). The stream is first opened at 16 kHz mono with WASAPI auto_convert (the Windows
 audio engine resamples and downmixes). If the device rejects that, it is reopened at the
 device's default sample rate and channel count; channels are averaged to mono and the
-audio is resampled to 16 kHz with a streaming soxr resampler. Without WASAPI (or if WASAPI
-can't open the device at all) the same sequence is tried on MME, then on the PortAudio
-default host API.
+audio is resampled to 16 kHz with a streaming soxr resampler. On Core Audio there is no
+auto_convert and built-in microphones run at 48 kHz, so that native-rate + soxr path is the
+normal one there. Without WASAPI (or if WASAPI can't open the device at all) the same
+sequence is tried on MME, then on the PortAudio default host API.
+
+Microphone permission: on macOS, recording needs a TCC grant. A denied grant shows up here
+as a stream that cannot be opened, or as one that opens but never delivers a callback, so
+both of those AudioDeviceError messages name System Settings. Nothing else is OS-specific.
 
 Device loss: PortAudio reports it as a stream that finishes without us stopping it, as
 callbacks that stop arriving, or as an exception in the callback. A watchdog
@@ -26,14 +34,26 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 
-from app.contracts import SAMPLE_RATE, AppError, AudioDeviceError
+from app.contracts import IS_MACOS, SAMPLE_RATE, AppError, AudioDeviceError
 
 log = logging.getLogger("roenspeak.audio.capture")
 
 BLOCK_MS = 32
 STALL_TIMEOUT_S = 2.0
 WATCHDOG_PERIOD_S = 0.25
-HOSTAPI_PREFERENCE = ("Windows WASAPI", "MME", "Windows DirectSound", "ALSA", "PulseAudio", "Core Audio")
+HOSTAPI_PREFERENCE = (
+    "Windows WASAPI", "Core Audio", "MME", "Windows DirectSound", "ALSA", "PulseAudio",
+)
+
+#: Appended to the AudioDeviceError messages that a denied macOS microphone grant produces.
+_MIC_PERMISSION_HINT = (
+    " On macOS, check that microphone access is allowed: System Settings > Privacy & "
+    "Security > Microphone, then switch RoEnSpeak on and try again."
+)
+
+
+def _mic_permission_hint() -> str:
+    return _MIC_PERMISSION_HINT if IS_MACOS else ""
 
 
 def _sd() -> Any:
@@ -210,7 +230,8 @@ class MicSource:
                 break
         else:
             raise AudioDeviceError(
-                "The microphone could not be opened. It may be in use or disconnected.",
+                "The microphone could not be opened. It may be in use or disconnected."
+                + _mic_permission_hint(),
                 details="; ".join(errors),
             )
 
@@ -306,8 +327,10 @@ class MicSource:
                         reason = "stream became inactive"
                 except Exception as e:
                     reason = f"stream query failed: {e!r}"
+            stalled = False
             if reason is None and time.monotonic() - self._last_callback > STALL_TIMEOUT_S:
                 reason = f"no audio callbacks for {STALL_TIMEOUT_S:.0f} s"
+                stalled = True
             if reason is None:
                 continue
             with self._lock:
@@ -323,7 +346,10 @@ class MicSource:
             if cb is not None:
                 try:
                     cb(AudioDeviceError(
-                        "The microphone stopped working (unplugged or taken by another app).",
+                        "The microphone stopped working (unplugged or taken by another app)."
+                        # A denied macOS microphone grant lets the stream open but never
+                        # delivers a block, which is what the stall watchdog sees.
+                        + (_mic_permission_hint() if stalled else ""),
                         details=reason,
                     ))
                 except Exception:

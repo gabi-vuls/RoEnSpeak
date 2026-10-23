@@ -1,4 +1,17 @@
-"""System tray icon (state-coloured) with Open / Arm-Disarm / Quit menu and balloons."""
+"""System tray icon with an Open / Arm-Disarm / Quit menu and balloon notifications.
+
+Windows: a state-coloured icon plus a tooltip with the status line.
+
+macOS: a menu-bar status item, which works differently in three ways.
+  * It takes a *template* icon, so the system can invert it for light/dark menu bars and for
+    the highlighted (menu-open) state. A template is alpha-only, which throws away the
+    colour-coded state language - so the macOS artwork distinguishes the states by
+    silhouette instead (see icon_art.render_tray_template).
+  * It has no tooltip, so the status line that Windows shows on hover is the first,
+    disabled item of the menu ("Listening · Alt+Q").
+  * A click opens the menu instead of activating the item, so "Open RoEnSpeak" in the menu
+    is the complete route to the window and Trigger/DoubleClick are ignored.
+"""
 
 from __future__ import annotations
 
@@ -8,8 +21,8 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
-from app.contracts import APP_NAME, AppError, AppState, Controller
-from app.ui.assets import tray_icon
+from app.contracts import APP_NAME, IS_MACOS, AppError, AppState, Controller
+from app.ui.assets import tray_icon, tray_template_icon
 from app.ui.status import STATE_LABELS, TRAY_STATE
 
 log = logging.getLogger("roenspeak.ui.tray")
@@ -25,8 +38,12 @@ class Tray(QObject):
         self._error_flag = False
         self._detail = ""
         self.icon_state = "disarmed"
+        self.status_line = ""
 
         self.menu = QMenu()
+        # macOS status items have no tooltip: the status line lives at the top of the menu.
+        self.act_status = QAction("", self.menu)
+        self.act_status.setEnabled(False)
         self.act_open = QAction("Open RoEnSpeak", self.menu)
         f = self.act_open.font()
         f.setBold(True)
@@ -37,6 +54,9 @@ class Tray(QObject):
         self.act_arm.triggered.connect(self._on_arm_triggered)
         self.act_quit = QAction("Quit", self.menu)
         self.act_quit.triggered.connect(self._on_quit)
+        if IS_MACOS:
+            self.menu.addAction(self.act_status)
+            self.menu.addSeparator()
         self.menu.addAction(self.act_open)
         self.menu.addAction(self.act_arm)
         self.menu.addSeparator()
@@ -77,25 +97,37 @@ class Tray(QObject):
             self.icon_state = "disarmed"  # non-fatal ERROR (e.g. model not downloaded): needs attention
         else:
             self.icon_state = TRAY_STATE[self._state]
-        self.tray.setIcon(tray_icon(self.icon_state))
+        self.tray.setIcon(tray_template_icon(self.icon_state) if IS_MACOS else tray_icon(self.icon_state))
         label = STATE_LABELS[self._state]
         if self._state == AppState.ERROR and not self._error_flag and self._detail:
             label = self._detail
         if self._error_flag and self._state != AppState.ERROR:
             label = f"{label} (error)"
         hk = f" · {cfg.hotkey}" if cfg.armed else " · hotkey off"
-        self.tray.setToolTip(f"{APP_NAME} - {label}{hk}")
+        self.status_line = f"{label}{hk}"
+        self.tray.setToolTip(f"{APP_NAME} - {self.status_line}")  # ignored on macOS
+        self.act_status.setText(self.status_line)
         self.act_arm.setChecked(cfg.armed)
         self.act_arm.setText(f"Hotkey armed ({cfg.hotkey})")
 
     def notify(self, title: str, message: str, warning: bool = False) -> None:
+        """Balloon / Notification Centre banner. Qt routes it to the macOS notification
+        centre, which silently drops it for a process without a bundle identifier (a dev
+        run). That is normal, not an error, so it is only logged at debug level - the same
+        text always reaches the log and, for errors, a dialog."""
         if not self.tray.isVisible() or not QSystemTrayIcon.supportsMessages():
             log.info("notification (no tray): %s - %s", title, message)
             return
         icon = QSystemTrayIcon.Warning if warning else QSystemTrayIcon.Information
         self.tray.showMessage(title, message, icon, 6000)
+        if IS_MACOS:
+            log.debug("notification sent to the notification centre: %s - %s", title, message)
 
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if IS_MACOS:
+            # A click on a status item with a menu opens the menu; opening the window too
+            # would steal focus behind the user's back. The menu's first action does it.
+            return
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
             self.open_requested.emit()
 
