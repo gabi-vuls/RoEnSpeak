@@ -13,13 +13,17 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from app.contracts import (
     CONFIG_SCHEMA_VERSION,
+    DEFAULT_PROMPT_HOTKEY,
+    FALLBACK_PROMPT_HOTKEY,
     MODELS,
     ComputeType,
     Config,
@@ -27,6 +31,7 @@ from app.contracts import (
     DecodeConfig,
     FilterConfig,
     InjectionMode,
+    LlmConfig,
     Task,
     UiConfig,
     VadConfig,
@@ -222,6 +227,31 @@ def _v_hotkey(v: Any) -> str:
         raise _Invalid(f"invalid hotkey {v!r}: {getattr(e, 'user_message', e)}") from None
 
 
+def _v_url(v: Any) -> str:
+    if not isinstance(v, str) or not v.strip():
+        raise _Invalid(f"expected a URL, got {v!r}")
+    url = v.strip().rstrip("/")
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise _Invalid(f"expected an http(s)://host[:port] URL, got {v!r}")
+    return url
+
+
+def _v_llm_model(v: Any) -> str:
+    if not isinstance(v, str) or not v.strip() or len(v.strip()) > 200 or any(c.isspace() for c in v.strip()):
+        raise _Invalid(f"expected an Ollama model tag like 'qwen2.5-coder:14b', got {v!r}")
+    return v.strip()
+
+
+_KEEP_ALIVE_RE = re.compile(r"^-?\d+[smh]?$")
+
+
+def _v_keep_alive(v: Any) -> str:
+    if not isinstance(v, str) or not _KEEP_ALIVE_RE.match(v.strip()):
+        raise _Invalid(f"expected a duration like '10m', '30s', '0' or '-1', got {v!r}")
+    return v.strip()
+
+
 _VAD_FIELDS: dict[str, Callable[[Any], Any]] = {
     "threshold": _v_float(0.05, 0.95),
     "neg_threshold_offset": _v_float(0.0, 0.5),
@@ -243,9 +273,19 @@ _UI_FIELDS: dict[str, Callable[[Any], Any]] = {
     "start_with_windows": _v_bool,
     "first_run_done": _v_bool,
 }
+_LLM_FIELDS: dict[str, Callable[[Any], Any]] = {
+    "enabled": _v_bool,
+    "ollama_url": _v_url,
+    "model": _v_llm_model,
+    "keep_alive": _v_keep_alive,
+    "timeout_s": _v_int(5, 600),
+    "max_input_chars": _v_int(100, 200_000),
+    "strict_check": _v_bool,
+}
 _TOP_FIELDS: dict[str, Callable[[Any], Any]] = {
     "armed": _v_bool,
     "hotkey": _v_hotkey,
+    "prompt_hotkey": _v_hotkey,
     "mic_device": _v_mic,
     "model": _v_model,
     "compute_type": _v_enum(ComputeType),
@@ -259,6 +299,7 @@ _SECTIONS: dict[str, tuple[type, dict[str, Callable[[Any], Any]]]] = {
     "vad": (VadConfig, _VAD_FIELDS),
     "filter": (FilterConfig, _FILTER_FIELDS),
     "ui": (UiConfig, _UI_FIELDS),
+    "llm": (LlmConfig, _LLM_FIELDS),
 }
 
 
@@ -314,6 +355,18 @@ def config_from_dict(raw: Mapping) -> tuple[Config, list[str]]:
             f"using default {defaults.model!r}."
         )
         kwargs["model"] = defaults.model
+
+    # Cross-field rule: the two hotkeys must differ -> the prompt hotkey falls back.
+    hotkey = kwargs.get("hotkey", defaults.hotkey)
+    prompt_hotkey = kwargs.get("prompt_hotkey", defaults.prompt_hotkey)
+    if prompt_hotkey.casefold() == hotkey.casefold():
+        fallback = (DEFAULT_PROMPT_HOTKEY if DEFAULT_PROMPT_HOTKEY.casefold() != hotkey.casefold()
+                    else FALLBACK_PROMPT_HOTKEY)
+        warnings.append(
+            f"Setting 'prompt_hotkey' is invalid ({prompt_hotkey!r} is already the dictation hotkey); "
+            f"using {fallback!r}."
+        )
+        kwargs["prompt_hotkey"] = fallback
 
     kwargs["schema_version"] = CONFIG_SCHEMA_VERSION
     return Config(**kwargs), warnings

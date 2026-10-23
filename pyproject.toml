@@ -46,10 +46,11 @@ include = ["app*"]
 testpaths = ["tests"]
 # Every hardware/desktop marker is excluded by default, so a bare `pytest` stays hardware-free on
 # both platforms. Opt in with `-m <marker>`.
-addopts = "-ra -m \"not gpu and not mic and not desktop and not metal\""
+addopts = "-ra -m \"not gpu and not mic and not desktop and not metal and not llm\""
 markers = [
     "gpu: needs an NVIDIA GPU with CUDA + a downloaded model (run with -m gpu)",
     "mic: needs a real microphone and a human speaking (run with -m mic)",
     "desktop: needs an interactive desktop session; injects real keystrokes (Windows: SendInput; macOS: CGEvent + an Accessibility grant) (run with -m desktop)",
     "metal: needs an Apple Silicon Mac with the whisper.cpp dylibs built and a downloaded ggml model (run with -m metal)",
+    "llm: needs a running Ollama with the configured prompt model pulled (ollama pull qwen2.5-coder:14b) (run with -m llm)",
 ]

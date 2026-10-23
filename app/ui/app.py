@@ -34,7 +34,7 @@ import time
 from typing import Callable, Optional
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QGuiApplication, QKeySequence
+from PySide6.QtGui import QAction, QColor, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import QApplication, QMenuBar, QMessageBox, QSystemTrayIcon
 
 from app.contracts import (
@@ -55,6 +55,8 @@ from app.contracts import (
     HotkeyChanged,
     InjectionBlockedError,
     Notification,
+    PromptHotkeyChanged,
+    PromptStatus,
     SegmentProcessed,
     StateChanged,
 )
@@ -70,6 +72,7 @@ from app.ui.dialogs import (
 from app.ui.facade import QtUiFacade
 from app.ui.hotkey_capture import modifier_names
 from app.ui.main_window import MainWindow
+from app.ui.overlay import TEXT as REC_TEXT
 from app.ui.overlay import RecOverlay
 from app.ui.sounds import SoundPlayer
 from app.ui.tray import Tray
@@ -84,6 +87,8 @@ KEYMENU_GRACE_S = 3.0
 FOCUS_GRACE_S = 2.0
 #: A fatal ErrorRaised this close before a transition into ERROR belongs to it.
 FATAL_PAIR_S = 1.0
+#: Overlay dot while a prompt adjustment runs (the "Processing" amber of app.ui.status).
+PROMPT_DOT_COLOR = "#f59e0b"
 
 
 def create_qapplication() -> QApplication:
@@ -219,6 +224,7 @@ class UiRoot:
         self._ending_session = False
         self._exiting = False
         self._show_pending = False
+        self._prompt_busy = False
         self._accessibility_prompted = False
         self._single_instance = None
         self.native_filter: Optional[NativeFilter] = None
@@ -228,6 +234,7 @@ class UiRoot:
         self.tray.open_requested.connect(self.show_main_window)
         self.window.hidden_to_tray.connect(self._on_hidden_to_tray)
         self.window.hotkey_edit.capture_state_changed.connect(self._on_capture_state)
+        self.window.prompt_hotkey_edit.capture_state_changed.connect(self._on_capture_state)
         self.window.settings.applied.connect(lambda _cfg: self._apply_ui_prefs())
 
         self.bridge = EventBridge(self.on_event)
@@ -441,13 +448,14 @@ class UiRoot:
 
     # -- native-filter hooks (Windows) ---------------------------------------
     def capture_active(self) -> bool:
-        return self.window.hotkey_edit.capturing
+        return self.window.hotkey_edit.capturing or self.window.prompt_hotkey_edit.capturing
 
     def suppress_keymenu(self) -> bool:
         return self.capture_active() or (time.monotonic() - self._capture_ended_at) < KEYMENU_GRACE_S
 
     def submit_native_combo(self, text: str) -> None:
-        self.window.hotkey_edit.submit_native_combo(text)
+        edit = self.window.prompt_hotkey_edit if self.window.prompt_hotkey_edit.capturing else self.window.hotkey_edit
+        edit.submit_native_combo(text)
 
     def on_end_session(self) -> None:
         if self._ending_session:
@@ -496,6 +504,12 @@ class UiRoot:
             self._on_error(ev)
         elif isinstance(ev, Notification):
             self.tray.notify(ev.title, ev.message, ev.warning)
+        elif isinstance(ev, PromptHotkeyChanged):
+            self.window.set_prompt_hotkey_state(ev.registered)
+        elif isinstance(ev, PromptStatus):
+            self._prompt_busy = ev.busy
+            self.window.set_prompt_status(ev.busy, ev.phase)
+            self._render_overlay()
         else:
             log.debug("ignored event %r", ev)
 
@@ -525,16 +539,23 @@ class UiRoot:
         if initial:
             self.window.set_state(state)
         self.tray.set_state(state, detail, self._hard_error)
-        if state == AppState.LISTENING and self.controller.config.ui.overlay:
-            self.overlay.show_overlay()
-        else:
-            self.overlay.hide_overlay()
+        self._render_overlay()
 
     def _apply_ui_prefs(self) -> None:
+        self._render_overlay()
+
+    def _render_overlay(self) -> None:
+        """REC while LISTENING; PROMPT (amber) while a prompt adjustment runs; else hidden."""
         if not self.controller.config.ui.overlay:
             self.overlay.hide_overlay()
         elif self._state == AppState.LISTENING:
+            self.overlay.set_label(REC_TEXT)
             self.overlay.show_overlay()
+        elif self._prompt_busy:
+            self.overlay.set_label("PROMPT", QColor(PROMPT_DOT_COLOR))
+            self.overlay.show_overlay()
+        else:
+            self.overlay.hide_overlay()
 
     def _on_error(self, ev: ErrorRaised) -> None:
         log.info("ErrorRaised kind=%s fatal=%s: %s", ev.kind, ev.fatal, ev.message)

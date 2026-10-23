@@ -1,4 +1,5 @@
-"""Small always-on-top, click-through "● REC" overlay shown while LISTENING.
+"""Small always-on-top, click-through "● REC" overlay shown while LISTENING (and "● PROMPT"
+while a prompt adjustment runs, see set_label).
 
 It must never take focus: dictated text is injected into the foreground window. The Qt flags
 (Tool | WindowDoesNotAcceptFocus | WindowTransparentForInput, WA_ShowWithoutActivating) are
@@ -29,6 +30,7 @@ from app.ui import _platform
 log = logging.getLogger("roenspeak.ui.overlay")
 
 TEXT = "REC"
+DOT_COLOR = QColor(239, 68, 68)  # red
 MARGIN_TOP = 14
 
 
@@ -51,8 +53,9 @@ class RecOverlay(QWidget):
         self._font = QFont(self.font())
         self._font.setBold(True)
         self._font.setPointSizeF(10.5)
-        fm = QFontMetrics(self._font)
-        self.setFixedSize(fm.horizontalAdvance(TEXT) + 46, fm.height() + 14)
+        self._text = ""
+        self._dot_color = DOT_COLOR
+        self.set_label(TEXT, DOT_COLOR)
         self._dot_on = True
         self._blink = QTimer(self)
         self._blink.setInterval(650)
@@ -60,6 +63,18 @@ class RecOverlay(QWidget):
         self._native_ready = False
         #: Windows: the resulting WS_EX_* style. macOS: the resulting NSWindow level.
         self.exstyle = 0
+
+    def set_label(self, text: str, dot_color: QColor = DOT_COLOR) -> None:
+        """Text and dot colour of the pill (default "REC" in red). Takes effect immediately."""
+        if text == self._text and dot_color == self._dot_color:
+            return
+        self._text = text
+        self._dot_color = QColor(dot_color)
+        fm = QFontMetrics(self._font)
+        self.setFixedSize(fm.horizontalAdvance(text) + 46, fm.height() + 14)
+        if self.isVisible():
+            self._place()
+        self.update()
 
     def _ensure_native(self) -> None:
         if not self._native_ready:
@@ -114,9 +129,11 @@ class RecOverlay(QWidget):
         p.drawRoundedRect(r, r.height() / 2, r.height() / 2)
         d = 10.0
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(239, 68, 68, 255 if self._dot_on else 90))
+        dot = QColor(self._dot_color)
+        dot.setAlpha(255 if self._dot_on else 90)
+        p.setBrush(dot)
         p.drawEllipse(QRectF(14, (r.height() - d) / 2 + 0.5, d, d))
         p.setFont(self._font)
         p.setPen(QColor("white"))
-        p.drawText(QRectF(30, 0, r.width() - 38, r.height()), Qt.AlignVCenter | Qt.AlignLeft, TEXT)
+        p.drawText(QRectF(30, 0, r.width() - 38, r.height()), Qt.AlignVCenter | Qt.AlignLeft, self._text)
         p.end()

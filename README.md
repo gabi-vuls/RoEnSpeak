@@ -17,9 +17,12 @@ microphone (16 kHz) -> Silero voice detection (splits speech into phrases) -> la
 
 Everything above the engine is the same code on both platforms, and one `config.json` is valid on both.
 
+On Windows a second hotkey, **Alt+P**, rewrites selected text into a clear, well-structured prompt with a local
+language model (see [Prompt adjustment](#prompt-adjustment-windows)).
+
 **Privacy.** Everything runs locally on your computer. Your audio and text never leave the machine. The app goes
 online only once, to download the speech model from Hugging Face the first time it runs (or when you pick a
-different model).
+different model). Prompt adjustment talks only to Ollama on your own machine (`localhost`).
 
 ---
 
@@ -28,6 +31,7 @@ different model).
 - [Requirements](#requirements)
 - [Install](#install)
 - [Using RoEnSpeak](#using-roenspeak)
+- [Prompt adjustment (Windows)](#prompt-adjustment-windows)
 - [Settings](#settings)
 - [Changing the hotkey](#changing-the-hotkey)
 - [Known limitations](#known-limitations)
@@ -207,11 +211,13 @@ Dock icon and no entry in ⌘-Tab, so the menu bar is the way back to the window
 - **Dictation hotkey ON/OFF switch.** ON registers the global hotkey. OFF unregisters it completely, so Alt+Q goes
   back to other apps, and it stops any dictation in progress. The setting is remembered across restarts.
 - **Hotkey** field and **Reset to default** (Alt+Q). See [Changing the hotkey](#changing-the-hotkey).
+- **Prompt hotkey** field and **Reset to default** (Alt+P), Windows only. See
+  [Prompt adjustment](#prompt-adjustment-windows). The hint under it shows progress while a prompt is rewritten.
 - **Status line.** Shows *Idle - hotkey is off*, *Downloading model NN%…*, *Loading model…*,
   *Ready - press Alt+Q to dictate*, *Listening - press Alt+Q to stop*, *Processing…*, or *Error: …*. Below it is
   the GPU name, model and compute type (for example `NVIDIA GeForce RTX 4060 Ti · large-v3 · float16`) and
   **Last latency**: the time from the end of your last phrase to the text being typed.
-- **Settings** in three tabs (General, Model, Advanced). Settings changes take effect when you click **Apply**.
+- **Settings** in tabs (General, Model, Prompt (Windows only), Advanced). Settings changes take effect when you click **Apply**.
   **Revert** throws away unsaved changes.
 - **Open log folder** button.
 - The version number is shown in the top-right corner.
@@ -223,6 +229,55 @@ Dock icon and no entry in ⌘-Tab, so the menu bar is the way back to the window
 - **Translate Romanian → English** (default): speak Romanian, English is typed.
 - **Romanian transcription only**: speak Romanian, Romanian is typed (with diacritics). This mode can also use
   large-v3-turbo.
+
+---
+
+## Prompt adjustment (Windows)
+
+Select a prompt you wrote anywhere (a chat box, an editor, a browser text area), press **Alt+P**, and the
+selection is replaced by the same prompt, restructured so another AI model reads it more reliably. A local
+model does the rewrite: **qwen2.5-coder:14b**, running in [Ollama](https://ollama.com). It works whether or not
+dictation is on.
+
+The rewrite follows strict rules:
+
+- **Nothing is lost.** Every fact, requirement, number, name, path, URL, identifier and hedge ("maybe", "if
+  possible") stays.
+- **Nothing is added.** No new requirements, examples or "best practices"; ambiguity is kept as written.
+- **Same language.** Romanian stays Romanian, English stays English, mixed stays mixed. Nothing is translated.
+- **Structure only where it helps.** A short prompt becomes one clean paragraph. A longer one gets Markdown
+  sections that have content (for example `## Goal`, `## Context`, `## Requirements`, `## Constraints`; in
+  Romanian `## Scop`, `## Cerințe`, …), bullet lists for enumerations, and code copied verbatim in code blocks.
+
+Every rewrite is **checked** before it is pasted: all numbers, URLs, paths, identifiers and code lines of your
+text must still be there, most of your words must survive and few new ones may appear. If the check fails, your
+text is left exactly as it was, the rewrite goes to the clipboard (Ctrl+V to use it anyway), and a notification
+says what looked wrong. You can turn this off with **Settings → Prompt → Keep my text if the rewrite may have
+lost information**; then the rewrite is pasted with a warning instead.
+
+The original text of every run is kept in `prompt_history.jsonl` in the log folder (see
+[File locations](#file-locations)), so a replaced selection can always be recovered.
+
+**Setup (once):**
+
+1. Install Ollama from <https://ollama.com/download> and start it (it runs in the tray).
+2. In a terminal: `ollama pull qwen2.5-coder:14b` (about 9 GB).
+3. In RoEnSpeak, **Settings → Prompt → Test connection** should say the model is installed.
+
+**Using it:**
+
+1. Select the text. Press **Alt+P** (you can let go of the keys right away).
+2. While the model works, an amber **● PROMPT** badge is shown (with the overlay setting on) and the main
+   window's prompt hint shows the step. The first run after Ollama loads the model takes longer.
+3. The selection is replaced by the rewrite. Your clipboard is restored afterwards.
+
+If you switch to another window before the rewrite is ready, nothing is replaced and the rewrite is put on the
+clipboard instead. While dictating (Alt+Q), Alt+P is refused; stop dictation first.
+
+**GPU memory.** The 14B model needs about 9 GB on top of the speech model (about 4.7 GB for large-v3 float16).
+On a 16 GB card both fit only when little else uses the GPU; otherwise Ollama runs part of the model on the CPU,
+which works but is slower. To free GPU memory, set **Keep model loaded** to a short time (or `0`), use the
+int8_float16 compute type, or set **Unload when idle** for the speech model.
 
 ---
 
@@ -251,6 +306,20 @@ Settings are saved to `%APPDATA%\RoEnSpeak\config.json`. Labels below are exactl
 | Unload when idle | Off (keep model loaded) | 0–1440 minutes. After this many idle minutes the model is unloaded to free GPU memory, and the status shows *Ready (model unloaded)*. The next hotkey press starts listening right away and reloads the model in the background, so the first phrase takes a few seconds longer. |
 | CPU mode (slow) | Off | Runs the model on the processor instead of the GPU. Expect several seconds per phrase. On Windows, use it only on a PC without a supported NVIDIA GPU; on macOS, only if Metal fails (whisper.cpp on the CPU is roughly 3x slower than on Metal). It is **never** turned on automatically: if the GPU doesn't work, RoEnSpeak shows an error instead of quietly switching to the CPU. |
 
+### Prompt tab (Windows)
+
+| Setting | Default | What it does |
+|---|---|---|
+| Prompt adjustment hotkey | On | Registers the prompt hotkey (Alt+P, changed in the main window). |
+| Ollama URL | `http://localhost:11434` | Where Ollama listens. |
+| Model | `qwen2.5-coder:14b` | Any model installed in Ollama (`ollama list`). |
+| Keep model loaded | `10m` | How long Ollama keeps the model in memory after a rewrite (`30s`, `10m`, `1h`). `0` unloads it right away (frees GPU memory, the next rewrite is slower); `-1` keeps it loaded. |
+| Timeout | 120 s | 5–600 s, including loading the model the first time. |
+| Max selection | 20000 chars | Longer selections are refused (nothing is changed). |
+| Keep my text if the rewrite may have lost information | On | See [Prompt adjustment](#prompt-adjustment-windows). |
+
+**Test connection** checks that Ollama is running and the model is installed, using the applied settings.
+
 ### Advanced tab
 
 | Setting | Default | What it does |
@@ -275,6 +344,7 @@ RoEnSpeak before you edit the file. If a value is invalid, it is reset to its de
 | Settings | `%APPDATA%\RoEnSpeak\config.json` |
 | Downloaded models | `%LOCALAPPDATA%\RoEnSpeak\models\<model name>\` |
 | Logs | `%LOCALAPPDATA%\RoEnSpeak\logs\roenspeak.log` (rotating, 5 × 2 MB). The **Open log folder** button opens this folder. |
+| Prompt history | `%LOCALAPPDATA%\RoEnSpeak\logs\prompt_history.jsonl` (rotating, 4 × 5 MB): original and rewritten text of every prompt adjustment, **in plain text**. `roenspeak.log` never contains your text. |
 
 You can paste these paths into the Explorer address bar.
 
@@ -388,6 +458,13 @@ Items marked **(Windows)** or **(macOS)** apply to that platform only; the rest 
 - **(Windows) Alt+Q overrides Microsoft Office's search shortcut.** In Microsoft 365 apps, Alt+Q normally jumps to the
   "Tell me / Search" box. While RoEnSpeak is running with the switch ON, Alt+Q starts dictation instead. If you
   need the Office shortcut, change RoEnSpeak's hotkey or turn the switch OFF.
+- **(Windows) Prompt adjustment copies with Ctrl+C.** Alt+P reads the selection by pressing Ctrl+C for you, so
+  it only works where Ctrl+C copies. In a console (Command Prompt, PowerShell, Windows Terminal) Ctrl+C with
+  nothing selected interrupts the running program instead, so select text first there. It can't read from or
+  paste into administrator windows, for the same UIPI reason as above.
+- **(Windows) Prompt adjustment is a rewrite by a language model.** The fidelity check catches dropped numbers,
+  names, paths, URLs, code and large additions, but it can't prove the meaning is unchanged. Read the result
+  before sending it; the original is always in `prompt_history.jsonl`.
 - **(Windows) NVIDIA GPUs only.** The fast path needs CUDA. On other hardware, only the slow CPU mode works.
 - **No leading space at the start of a dictation.** The first phrase of each new dictation is typed without a
   space in front. Type the space yourself if you're continuing an existing sentence. Later phrases in the same

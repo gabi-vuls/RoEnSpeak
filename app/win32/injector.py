@@ -24,6 +24,7 @@ from app.contracts import (
 log = logging.getLogger("roenspeak.win32.injector")
 
 VK_CONTROL = 0x11
+VK_C = 0x43
 VK_V = 0x56
 
 # Any whitespace run that contains a CR, LF or TAB becomes one space.
@@ -39,6 +40,45 @@ def utf16_code_units(text: str) -> list[str]:
     """Split text into single UTF-16 code units (astral chars become a surrogate pair)."""
     raw = text.encode("utf-16-le", "surrogatepass")
     return [chr(int.from_bytes(raw[i:i + 2], "little")) for i in range(0, len(raw), 2)]
+
+
+def wait_modifiers_released(api: WinApi, timeout_s: float, poll_s: float, text: str) -> None:
+    """Step 3 of inject(): poll until no MODIFIER_VKS key is down; ModifiersHeldError(text)
+    after timeout_s."""
+    deadline: Optional[float] = None
+    while True:
+        held = [vk for vk in MODIFIER_VKS if api.get_async_key_state(vk) & 0x8000]
+        if not held:
+            return
+        now = api.monotonic()
+        if deadline is None:
+            deadline = now + timeout_s
+            log.debug("waiting for modifiers to be released: %s", [hex(v) for v in held])
+        elif now >= deadline:
+            log.warning("modifiers still held after %.1f s: %s; text dropped",
+                        timeout_s, [hex(v) for v in held])
+            raise ModifiersHeldError(text)
+        api.sleep(poll_s)
+
+
+def check_foreground_integrity(api: WinApi, text: str) -> int:
+    """Step 4 of inject() (UIPI): raise InjectionBlockedError(text) when the foreground
+    window's process runs at a higher (or unknown) integrity level. Returns its hwnd."""
+    try:
+        own_il = api.get_current_process_integrity_level()
+    except (OSError, AppError) as exc:
+        log.warning("could not read own integrity level: %s", exc)
+        raise InjectionBlockedError(text, reason="unknown_integrity") from exc
+    hwnd = api.get_foreground_window()
+    pid = api.get_window_process_id(hwnd)
+    il = api.get_process_integrity_level(pid)
+    if il is None:
+        log.warning("foreground hwnd=%#x pid=%d integrity unknown; injection blocked", hwnd, pid)
+        raise InjectionBlockedError(text, reason="unknown_integrity")
+    if il > own_il:
+        log.warning("foreground pid=%d integrity %#x > own %#x; injection blocked", pid, il, own_il)
+        raise InjectionBlockedError(text, reason="elevated")
+    return hwnd
 
 
 class Win32TextInjector:
@@ -105,41 +145,27 @@ class Win32TextInjector:
         log.debug("injected chars=%d mode=%s events=%d", len(typed), mode.value, sent)
         return InjectionOutcome(injected_text=typed, mode=mode, events_sent=sent, t_injected=t_injected)
 
+    def paste_raw(self, text: str) -> Optional[InjectionOutcome]:
+        """Paste text exactly as given (newlines and tabs kept, as CRLF) through the clipboard,
+        whatever the injection mode. Used by prompt adjustment to replace a selection; steps 3-4
+        of inject() apply, no normalization or spacing. Empty text -> None, nothing changes."""
+        if not text:
+            return None
+        typed = re.sub(r"\r?\n", "\r\n", text)
+        self._wait_modifiers_released(text)
+        self._check_integrity(text)
+        sent, t_injected = self._paste(typed, text)
+        log.debug("pasted raw chars=%d events=%d", len(typed), sent)
+        return InjectionOutcome(injected_text=typed, mode=InjectionMode.CLIPBOARD, events_sent=sent,
+                                t_injected=t_injected)
+
     # --- steps ---------------------------------------------------------------------------
 
     def _wait_modifiers_released(self, text: str) -> None:
-        api = self._api
-        deadline: Optional[float] = None
-        while True:
-            held = [vk for vk in MODIFIER_VKS if api.get_async_key_state(vk) & 0x8000]
-            if not held:
-                return
-            now = api.monotonic()
-            if deadline is None:
-                deadline = now + self._modifier_timeout_s
-                log.debug("waiting for modifiers to be released: %s", [hex(v) for v in held])
-            elif now >= deadline:
-                log.warning("modifiers still held after %.1f s: %s; text dropped",
-                            self._modifier_timeout_s, [hex(v) for v in held])
-                raise ModifiersHeldError(text)
-            api.sleep(self._poll_s)
+        wait_modifiers_released(self._api, self._modifier_timeout_s, self._poll_s, text)
 
     def _check_integrity(self, text: str) -> None:
-        api = self._api
-        try:
-            own_il = api.get_current_process_integrity_level()
-        except (OSError, AppError) as exc:
-            log.warning("could not read own integrity level: %s", exc)
-            raise InjectionBlockedError(text, reason="unknown_integrity") from exc
-        hwnd = api.get_foreground_window()
-        pid = api.get_window_process_id(hwnd)
-        il = api.get_process_integrity_level(pid)
-        if il is None:
-            log.warning("foreground hwnd=%#x pid=%d integrity unknown; injection blocked", hwnd, pid)
-            raise InjectionBlockedError(text, reason="unknown_integrity")
-        if il > own_il:
-            log.warning("foreground pid=%d integrity %#x > own %#x; injection blocked", pid, il, own_il)
-            raise InjectionBlockedError(text, reason="elevated")
+        check_foreground_integrity(self._api, text)
 
     def _send_unicode(self, typed: str, text: str) -> tuple[int, float]:
         events: list[KeyEvent] = []

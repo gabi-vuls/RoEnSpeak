@@ -46,6 +46,10 @@ APP_VERSION = "0.1.0"
 SAMPLE_RATE = 16_000
 VAD_FRAME_SAMPLES = 512  # 32 ms at 16 kHz; Silero v6 frame size used by faster-whisper
 DEFAULT_HOTKEY = "Alt+Q"  # Windows: Alt+Q, macOS: Option+Q (same string, see Modifier)
+#: Prompt adjustment hotkey (select text, press it, the selection is rewritten by the local LLM).
+DEFAULT_PROMPT_HOTKEY = "Alt+P"
+#: Used instead of DEFAULT_PROMPT_HOTKEY when the dictation hotkey already is Alt+P.
+FALLBACK_PROMPT_HOTKEY = "Alt+Shift+P"
 SOURCE_LANGUAGE = "ro"
 
 #: Host platform switches. Platform code lives in app/win32 (Windows) and app/macos (macOS);
@@ -389,11 +393,12 @@ class HotkeyConflictError(AppError):
     """RegisterHotKey (Windows) / RegisterEventHotKey (macOS) failed: another app or the OS
     owns the combo. ``win32_error`` carries GetLastError on Windows and the OSStatus on macOS."""
 
-    def __init__(self, hotkey: str, *, win32_error: int = 0, details: str = "") -> None:
+    def __init__(self, hotkey: str, *, win32_error: int = 0, details: str = "",
+                 message: Optional[str] = None) -> None:
         api = "RegisterHotKey failed, GetLastError" if IS_WINDOWS else "RegisterEventHotKey failed, OSStatus"
         super().__init__(
-            f"{hotkey} is already in use by another application or by {os_display_name()}. "
-            "Choose a different combination.",
+            message or (f"{hotkey} is already in use by another application or by {os_display_name()}. "
+                        "Choose a different combination."),
             details=details or f"{api}={win32_error}",
         )
         self.hotkey = hotkey
@@ -451,6 +456,36 @@ class ModifiersHeldError(AppError):
         keys = "Ctrl/Shift/Alt/Win" if IS_WINDOWS else "Control/Shift/Option/Command"
         super().__init__(f"Release {keys} so the dictated text can be typed.")
         self.text = text
+
+
+class NothingSelectedError(AppError):
+    """Prompt adjustment: the copy chord produced no text (nothing selected, or the focused
+    app does not copy on Ctrl+C). Nothing is pasted."""
+
+    def __init__(self, details: str = "") -> None:
+        super().__init__("No text is selected. Select the prompt text first, then press the hotkey.",
+                         details=details)
+
+
+class LlmError(AppError):
+    """The local LLM (Ollama) call failed. Subclasses carry the actionable cases."""
+
+
+class LlmUnavailableError(LlmError):
+    """Ollama is not reachable at LlmConfig.ollama_url (not installed / not running)."""
+
+
+class LlmModelMissingError(LlmError):
+    """Ollama is running but LlmConfig.model is not pulled."""
+
+    def __init__(self, model: str, *, details: str = "") -> None:
+        super().__init__(f"The model {model} is not installed in Ollama. Run: ollama pull {model}",
+                         details=details)
+        self.model = model
+
+
+class LlmTimeoutError(LlmError):
+    """No answer within LlmConfig.timeout_s."""
 
 
 class AudioDeviceError(AppError):
@@ -542,6 +577,23 @@ class UiConfig:
     first_run_done: bool = False  # set after the first-run download/GPU check finished
 
 
+DEFAULT_OLLAMA_URL = "http://localhost:11434"
+DEFAULT_LLM_MODEL = "qwen2.5-coder:14b"
+
+
+@dataclass(frozen=True)
+class LlmConfig:
+    """Prompt adjustment through a local Ollama server (Windows only for now)."""
+
+    enabled: bool = True  # registers Config.prompt_hotkey
+    ollama_url: str = DEFAULT_OLLAMA_URL  # http(s)://host[:port], no trailing slash
+    model: str = DEFAULT_LLM_MODEL  # Ollama model tag
+    keep_alive: str = "10m"  # Ollama keep_alive: "<n>[s|m|h]", "0" unloads right away, "-1" keeps it loaded
+    timeout_s: int = 120  # whole request, including a cold model load. 5..600
+    max_input_chars: int = 20_000  # longer selections are refused. 100..200000
+    strict_check: bool = True  # fidelity check failed -> don't paste, put the result on the clipboard
+
+
 @dataclass(frozen=True)
 class Config:
     """Persisted to config_path() as JSON. Enums serialize as their .value, tuples as lists,
@@ -549,6 +601,7 @@ class Config:
 
     armed: bool = True
     hotkey: str = DEFAULT_HOTKEY  # canonical display string, see HotkeyParser
+    prompt_hotkey: str = DEFAULT_PROMPT_HOTKEY  # never equal to hotkey (config_from_dict enforces it)
     mic_device: Optional[str] = None  # device name as reported by AudioSource.list_input_devices(); None = system default
     model: str = DEFAULT_MODEL  # key of MODELS
     compute_type: ComputeType = ComputeType.FLOAT16
@@ -560,6 +613,7 @@ class Config:
     vad: VadConfig = field(default_factory=VadConfig)
     filter: FilterConfig = field(default_factory=FilterConfig)
     ui: UiConfig = field(default_factory=UiConfig)
+    llm: LlmConfig = field(default_factory=LlmConfig)
     schema_version: int = CONFIG_SCHEMA_VERSION
 
 
@@ -1053,6 +1107,9 @@ class WinApi(Protocol):
         """GlobalLock'd contents of an HGLOBAL-backed format; None for non-HGLOBAL formats (bitmaps etc.)."""
         ...
     def set_clipboard_bytes(self, fmt: int, data: bytes) -> bool: ...
+    def get_clipboard_sequence_number(self) -> int:
+        """GetClipboardSequenceNumber: increments on every clipboard change (no open needed)."""
+        ...
 
     # single instance / misc
     def create_mutex(self, name: str) -> tuple[int, bool]:
@@ -1131,6 +1188,16 @@ class ClipboardBackend(Protocol):
     def save(self) -> ClipboardSnapshot: ...
     def set_text(self, text: str) -> None: ...
     def restore(self, snapshot: ClipboardSnapshot) -> None: ...
+
+
+@runtime_checkable
+class ClipboardReader(Protocol):
+    """Read side of the clipboard, used only by prompt adjustment (Windows: Win32Clipboard).
+    get_text(): CF_UNICODETEXT as str, None when the clipboard holds no text.
+    clear(): empty the clipboard (so a following copy is detectable)."""
+
+    def get_text(self) -> Optional[str]: ...
+    def clear(self) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -1274,9 +1341,25 @@ class Notification:
     warning: bool = False
 
 
+@dataclass(frozen=True)
+class PromptHotkeyChanged:
+    """The prompt adjustment hotkey registration changed (independent of dictation arming)."""
+
+    hotkey: Optional[str]  # display string or None when unregistered
+    registered: bool
+
+
+@dataclass(frozen=True)
+class PromptStatus:
+    """Prompt adjustment progress. phase: "copying" | "rewriting" | "pasting" | "idle"."""
+
+    busy: bool
+    phase: str = "idle"
+
+
 AppEvent = Union[
     StateChanged, EngineLoaded, SegmentProcessed, DownloadProgressEvent, DownloadFinished,
-    HotkeyChanged, ConfigChanged, ErrorRaised, Notification,
+    HotkeyChanged, ConfigChanged, ErrorRaised, Notification, PromptHotkeyChanged, PromptStatus,
 ]
 
 
@@ -1324,6 +1407,11 @@ class Controller(Protocol):
     set_hotkey(text): parse + register immediately + persist. Raises HotkeyParseError /
       HotkeyConflictError (previous hotkey stays). If disarmed, only validates the combo and saves it.
     reset_hotkey(): set_hotkey(DEFAULT_HOTKEY).
+    set_prompt_hotkey(text) / reset_prompt_hotkey(): the same for Config.prompt_hotkey, which is
+      registered whenever llm.enabled (armed does not matter). Both setters raise
+      HotkeyConflictError when the combo equals the other hotkey.
+    test_llm_connection(callback): checks Ollama + model on a core thread and calls
+      callback(ok: bool, message: str) there (the UI marshals it).
     update_config(cfg): validates, persists, and applies the diff (mic, injection mode, VAD,
       filter, autostart, overlay/sounds apply live; model/compute_type/cpu_mode trigger a
       reload or download). Raises ConfigError for invalid values.
@@ -1350,6 +1438,9 @@ class Controller(Protocol):
         Temporarily unregisters/re-registers without touching Config.armed. No-op when disarmed."""
         ...
     def reset_hotkey(self) -> Hotkey: ...
+    def set_prompt_hotkey(self, text: str) -> Hotkey: ...
+    def reset_prompt_hotkey(self) -> Hotkey: ...
+    def test_llm_connection(self, callback: Callable[[bool, str], None]) -> None: ...
     def update_config(self, cfg: Config) -> None: ...
     def list_input_devices(self) -> list[str]: ...
     def start_model_download(self) -> None: ...
@@ -1461,6 +1552,14 @@ class UiFacade(Protocol):
 # app.core.platform  -- the ONLY platform dispatch. parse_hotkey/format_hotkey plus
 #     make_probe/make_engine/make_downloader/make_api/make_clipboard/make_injector/
 #     make_autostart/make_hotkey_factory/make_single_instance/open_folder/gpu_requirement_message.
+# app.win32.selection.Win32SelectionGrabber(api: WinApi, clipboard: Win32Clipboard,
+#     modifier_timeout_s=5.0, copy_timeout_s=0.8, poll_s=0.01) -> .grab() -> Selection(text, hwnd)
+# app.llm.ollama.OllamaClient(base_url, model, keep_alive, timeout_s) -> .chat(...) / .health()
+# app.llm.prompt_text.SYSTEM_PROMPT / build_user_message(text)
+# app.llm.postprocess.clean_output(text) ; check_fidelity(original, output) -> FidelityReport
+# app.core.prompt_adjust.PromptAdjuster(...)                -- prompt adjustment worker (core)
+# app.core.prompt_history.PromptHistory(path=None)          -- logs_dir()/prompt_history.jsonl
+#
 # app.core.config.JsonConfigStore(path: Path | None = None)  -> ConfigStore
 #     app.core.config.config_to_dict(cfg) -> dict ; config_from_dict(raw) -> tuple[Config, list[str]]
 #     app.core.config.migrate(raw: dict) -> dict   (any schema -> current schema dict; pure)

@@ -38,6 +38,7 @@ from app.contracts import (
     DecodeConfig,
     FilterConfig,
     InjectionMode,
+    LlmConfig,
     Task,
     UiConfig,
     VadConfig,
@@ -55,6 +56,7 @@ CANONICAL_SUPER_HOTKEY = "Cmd+F12" if contracts.IS_MACOS else "Win+F12"
 DEFAULT_DICT = {
     "armed": True,
     "hotkey": "Alt+Q",
+    "prompt_hotkey": "Alt+P",
     "mic_device": None,
     "model": "large-v3",
     "compute_type": "float16",
@@ -78,6 +80,15 @@ DEFAULT_DICT = {
         "blocklist": list(DEFAULT_BLOCKLIST),
     },
     "ui": {"overlay": True, "sounds": True, "start_with_windows": False, "first_run_done": False},
+    "llm": {
+        "enabled": True,
+        "ollama_url": "http://localhost:11434",
+        "model": "qwen2.5-coder:14b",
+        "keep_alive": "10m",
+        "timeout_s": 120,
+        "max_input_chars": 20000,
+        "strict_check": True,
+    },
     "schema_version": CONFIG_SCHEMA_VERSION,
 }
 
@@ -85,6 +96,7 @@ DEFAULT_DICT = {
 CUSTOM = Config(
     armed=False,
     hotkey="Ctrl+Alt+F9",
+    prompt_hotkey="Ctrl+Alt+F10",
     mic_device="Microfon (Realtek® Audio)",
     model="medium",
     compute_type=ComputeType.INT8_FLOAT16,
@@ -98,6 +110,8 @@ CUSTOM = Config(
     filter=FilterConfig(no_speech_prob_threshold=0.7, avg_logprob_threshold=-2.0,
                         compression_ratio_threshold=3.0, blocklist=("foo bar", "baz*")),
     ui=UiConfig(overlay=False, sounds=False, start_with_windows=True, first_run_done=True),
+    llm=LlmConfig(enabled=False, ollama_url="http://192.168.1.20:11500", model="qwen2.5-coder:7b",
+                  keep_alive="30s", timeout_s=60, max_input_chars=5000, strict_check=False),
 )
 
 
@@ -132,6 +146,11 @@ def _with_value(raw: dict, path: tuple[str, ...], value) -> dict:
 def test_spec_defaults():
     c = Config()
     assert c.hotkey == "Alt+Q"
+    assert c.prompt_hotkey == "Alt+P"
+    assert c.llm == LlmConfig()
+    assert c.llm.model == "qwen2.5-coder:14b"
+    assert c.llm.ollama_url == "http://localhost:11434"
+    assert c.llm.enabled is True and c.llm.strict_check is True
     assert c.model == "large-v3"
     assert c.compute_type == ComputeType.FLOAT16
     assert c.decode.beam_size == 5
@@ -344,6 +363,23 @@ INVALID_FIELDS = [
     (("ui", "sounds"), None),
     (("ui", "start_with_windows"), 0),
     (("ui", "first_run_done"), "yes"),
+    (("prompt_hotkey",), 5),
+    (("prompt_hotkey",), "P"),
+    (("prompt_hotkey",), "Ctrl+Alt+F9"),  # same as the dictation hotkey
+    (("llm", "enabled"), "yes"),
+    (("llm", "ollama_url"), "localhost:11434"),
+    (("llm", "ollama_url"), "ftp://localhost"),
+    (("llm", "ollama_url"), ""),
+    (("llm", "model"), ""),
+    (("llm", "model"), "qwen coder"),
+    (("llm", "model"), 14),
+    (("llm", "keep_alive"), "10 minutes"),
+    (("llm", "keep_alive"), 10),
+    (("llm", "timeout_s"), 4),
+    (("llm", "timeout_s"), 601),
+    (("llm", "max_input_chars"), 99),
+    (("llm", "max_input_chars"), 200_001),
+    (("llm", "strict_check"), "no"),
 ]
 
 
@@ -378,6 +414,14 @@ VALID_EDGES = [
     (("filter", "avg_logprob_threshold"), 0.0),
     (("filter", "compression_ratio_threshold"), 1.0),
     (("filter", "compression_ratio_threshold"), 10.0),
+    (("llm", "timeout_s"), 5),
+    (("llm", "timeout_s"), 600),
+    (("llm", "max_input_chars"), 100),
+    (("llm", "max_input_chars"), 200_000),
+    (("llm", "keep_alive"), "0"),
+    (("llm", "keep_alive"), "-1"),
+    (("llm", "keep_alive"), "2h"),
+    (("llm", "ollama_url"), "https://ollama.example.com"),
     (("filter", "blocklist"), []),
 ]
 
@@ -677,3 +721,35 @@ def test_store_load_does_not_rewrite_schema0_file(tmp_path):
     path.write_text(text, encoding="utf-8")
     JsonConfigStore(path).load()
     assert path.read_text(encoding="utf-8") == text
+
+
+# ---------------------------------------------------------------------------
+# Prompt adjustment settings
+# ---------------------------------------------------------------------------
+
+
+def test_llm_url_is_normalized():
+    cfg, warnings = config_from_dict({**DEFAULT_DICT, "llm": {"ollama_url": " http://localhost:11434/ "}})
+    assert warnings == []
+    assert cfg.llm.ollama_url == "http://localhost:11434"
+
+
+def test_prompt_hotkey_equal_to_dictation_hotkey_falls_back_to_default():
+    cfg, warnings = config_from_dict({**DEFAULT_DICT, "hotkey": "Ctrl+Alt+F9", "prompt_hotkey": "ctrl+alt+f9"})
+    assert cfg.hotkey == "Ctrl+Alt+F9"
+    assert cfg.prompt_hotkey == "Alt+P"
+    assert len(warnings) == 1 and "prompt_hotkey" in warnings[0]
+
+
+def test_dictation_hotkey_alt_p_moves_prompt_hotkey_to_the_fallback():
+    cfg, warnings = config_from_dict({**DEFAULT_DICT, "hotkey": "Alt+P"})
+    assert cfg.hotkey == "Alt+P"
+    assert cfg.prompt_hotkey == contracts.FALLBACK_PROMPT_HOTKEY
+    assert len(warnings) == 1
+
+
+def test_old_config_without_llm_keys_loads_with_defaults():
+    raw = {k: v for k, v in DEFAULT_DICT.items() if k not in ("llm", "prompt_hotkey")}
+    cfg, warnings = config_from_dict(raw)
+    assert warnings == []
+    assert cfg == Config()

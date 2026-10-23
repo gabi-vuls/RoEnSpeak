@@ -1,8 +1,11 @@
-"""Clipboard save / set text / restore (``contracts.ClipboardBackend``). Injection thread only."""
+"""Clipboard save / set text / restore (``contracts.ClipboardBackend``) and the read side used
+by prompt adjustment (``contracts.ClipboardReader``). Injection / prompt-adjust thread only."""
 
 from __future__ import annotations
 
 import logging
+
+from typing import Optional
 
 from app.contracts import AppError, ClipboardSnapshot, WinApi
 
@@ -67,6 +70,27 @@ class Win32Clipboard:
                 if not fmt or not api.set_clipboard_bytes(fmt, _DWORD_ZERO):
                     log.warning("could not set clipboard format %s (id=%s); text may appear in clipboard history",
                                 name, fmt)
+        finally:
+            api.close_clipboard()
+
+    def get_text(self) -> Optional[str]:
+        api = self._api
+        self._open()
+        try:
+            data = api.get_clipboard_bytes(CF_UNICODETEXT)
+        finally:
+            api.close_clipboard()
+        if data is None:
+            return None
+        text = data.decode("utf-16-le", "replace")
+        end = text.find("\0")
+        return text if end < 0 else text[:end]
+
+    def clear(self) -> None:
+        api = self._api
+        self._open()
+        try:
+            api.empty_clipboard()
         finally:
             api.close_clipboard()
 

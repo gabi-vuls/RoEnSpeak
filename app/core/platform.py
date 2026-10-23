@@ -50,6 +50,7 @@ log = logging.getLogger("roenspeak.core.platform")
 __all__ = [
     "IS_WINDOWS",
     "IS_MACOS",
+    "SUPPORTS_PROMPT_ADJUST",
     "UNSUPPORTED_PLATFORM_MESSAGE",
     "parse_hotkey",
     "format_hotkey",
@@ -60,6 +61,7 @@ __all__ = [
     "make_api",
     "make_clipboard",
     "make_injector",
+    "make_selection_grabber",
     "make_autostart",
     "make_hotkey_factory",
     "make_single_instance",
@@ -67,6 +69,10 @@ __all__ = [
     "gpu_requirement_message",
     "autostart_label",
 ]
+
+#: Prompt adjustment (copy selection -> local LLM -> paste) has a Windows implementation only;
+#: elsewhere the prompt hotkey is never registered and its settings are hidden.
+SUPPORTS_PROMPT_ADJUST = IS_WINDOWS
 
 #: Shown when the app is started on a host that has no platform layer.
 UNSUPPORTED_PLATFORM_MESSAGE = "RoEnSpeak supports Windows and macOS."
@@ -208,6 +214,15 @@ def make_injector(api: Any, clipboard: ClipboardBackend, mode: InjectionMode) ->
         from app.macos.injector import MacTextInjector
 
         return MacTextInjector(api, clipboard, mode=mode)
+    raise _unsupported()
+
+
+def make_selection_grabber(api: Any, clipboard: ClipboardBackend) -> Any:
+    """Copies the focused window's selection with Ctrl+C (prompt adjustment). Windows only."""
+    if IS_WINDOWS:
+        from app.win32.selection import Win32SelectionGrabber
+
+        return Win32SelectionGrabber(api, clipboard, clipboard)  # Win32Clipboard is also the reader
     raise _unsupported()
 
 
